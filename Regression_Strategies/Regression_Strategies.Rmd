@@ -1,0 +1,894 @@
+---
+title: |
+ Vignette for Recommended Modeling Strategies
+author: "[Abraham Apfel](mailto:abraham.apfel2@gmail.com)"
+date: '`r format(Sys.time(), "%A, %B %e, %Y")`'
+output:
+  html_document:
+    toc: yes
+    toc_depth: '4'
+    df_print: paged
+  pdf_document:
+    toc: yes
+    toc_depth: 5
+    number_sections: yes
+bibliography: 
+- references/Regression_strategies.bib
+csl: "references/elsevier-harvard2.csl"
+---
+
+```{r, echo=FALSE, message=FALSE}
+# Free up memory by forcing garbage collection
+invisible(gc())
+# Pretty printing in knitr
+# library(printr)
+# Manually set the seed to an arbitrary number for consistency in reports
+set.seed(1234, kind="Mersenne-Twister", normal.kind="Inversion")
+# Do not convert character vectors to factors unless explicitly indicated
+options(stringsAsFactors=FALSE)
+
+startTime <- Sys.time()
+```
+
+```{r global_options, include=FALSE}
+# use include=FALSE to have the chunk evaluated, but neither the code nor its output displayed.
+knitr::opts_chunk$set(echo=FALSE, message=FALSE,
+                      error=FALSE,  # Stop when encountering an error
+                      fig.align="center", fig.width=12, fig.height=8, fig.path='figs/', 
+                      dev=c('pdf', 'png')) # output figures as both pdf and png
+```
+
+```{r, load_libraries_setwd}
+library(conflicted)  # forces double colon references for functions that appear in multiple packages
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(lattice)
+library(corrplot)
+library(rms)
+library(pcaPP)
+library(bmsPURR)
+
+# For functions that appear in multiple packages, specify which one we want.
+conflict_prefer("filter", "dplyr")
+conflict_prefer("rename", "dplyr")
+conflict_prefer("select", "dplyr")
+# 
+if ("rstudioapi" %in% installed.packages()[, "Package"] & rstudioapi::isAvailable() & interactive()) {
+  # When in RStudio, dynamically sets working directory to path of this script
+  setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+  # Set the default ggplot theme to "theme_bw" with default font size
+  theme_set(theme_bw(20))
+} else {
+  # Set the default ggplot theme to "theme_bw" with specified base font size
+  theme_set(theme_bw(20))
+}
+
+          
+
+```
+
+\newpage
+
+<!-- # Summary -->
+
+<!-- Executive summary/abstract go here. Briefly describe your problem, methods and results. Suggest future directions if applicable. -->
+
+<!-- # Background -->
+
+<!-- {{background}} -->
+
+# Purpose
+
+The purpose of this vignette is to be used as a guide for colleagues performing
+analyses involving regression modeling. Much of these strategies in this guide currently
+focus on the situation where the primary endpoint is binary, but can be generalized
+to continuous and survival outcomes as well. They are largely based off of Frank
+Harrell's book [@harrell2015regression].
+
+In this vignette we cover methods for imputation of missing data, flexible modeling techniques (e.g. cubic splines), proper visualizations, etc.
+
+# Dataset
+We make use of data consisting of 1638 subjects from 9 randomized clinical trials for demonstration purposes.
+The goal of our analysis is to predict a binary outcome ("Outcome") from 19 clinical variables.
+
+
+
+
+\newpage
+
+# Multiple Imputation
+
+```{r load_data, echo=F}
+results <- "/stash/results/dev/apfela/P03632_Regression_Strategies_Vignette"
+mod_dat <- readRDS("/stash/results/dev/apfela/P03632_Regression_Strategies_Vignette/Anonymized_dat.rds")
+
+```
+
+## Assessing the Extent of Missingness in your Data
+
+The first step in any analysis is to assess the extent of missing data in your cohort. If there are any variables for which there is a very high proportion missing (e.g. > 50%), it may be preferable to leave that variable out of the model since it will be very difficult for the imputation models to predict that variable well. One useful tool to get a high level overview of your data is the `describe` function from the `rms` package.
+
+It may also be helpful to look at a correlation plot of the variables in your dataset. If some of your variables are highly correlated it will help advise you to include them in your imputation model even if they are not expected to be included in your actual analysis. This can be implemented via the `corrplot` function. We recommend for this step to include any columns of data you have access to even though you don't plan on using them in your model.
+
+A tool to help visualize the patterns and extent of missingness in your data is the `naclus` and `naplot` functions.  `naclus` creates a similarity matrix of the columns in your data according to the fraction of subjects with missing data.  `naplot` offers useful visualizations.
+
+
+```{r Assess_Missing, echo = T}
+
+# Get overview of dataset
+describe(mod_dat)
+
+# We first turn all variables into numeric just for the purpose of this correlation plot
+mod_num <- sapply(mod_dat, as.numeric)
+
+
+# Make correlation matrix to inform on imputation model
+cor_mat <- rcorr(mod_num)
+
+# Plot the correlation matrix
+corrplot(cor_mat$r)
+
+```
+
+
+## Prepare for Multiple Imputation
+
+In general, we recommend using multiple imputation to impute the missing data rather than the more commonly (and simpler) applied approach of performing a complete case analysis. One reason for this is that in a complete case analysis any subject with any missing data will be thrown out of the model. Thus it is a very inefficient approach to modeling. Additionally, a complete case analysis assumes the data is Missing Completely at Random (MCAR), a very strong assumption (assumes that a data point which is missing is completely unrelated to any characteristic of the subject) whereas an imputation model only assumes the data was Missing at Random (MAR), a much weaker assumption (assumes that a data point which is missing may depend on the values of variables which are measured).
+
+We also don't recommend imputing the mean/median of a given variable because that will artificially deflate the relationship between that variable and response and will thus yield a very conservative estimate of the true relationship.
+
+A much preferred approach is to impute the missing values by building a model predicting the missing value based on all of the other variables. In particular, we recommend the Predictive Mean Matching method via Chained equations (see Chapter 3 in [@harrell2015regression]) for more details. This is the default method applied by the `aregimpute` function we demonstrate below (this is as opposed to the popular `MICE` package which by default uses regular regression which is more prone to extreme imputations and less robust).
+
+We also recommend strongly to use multiple imputations instead of relying on a single imputation of the missing value. The reason for this is because a single imputation will not capture the uncertainty that exists in the imputation of the missing value itself, which will yield underestimated standard errors in the model outputs and overly optimistic associations between the imputed variable and the outcome (biased coefficients). By applying multiple imputations we can capture that uncertainty and yield unbiased estimates of the coefficients as well.
+
+The question then arises, how many imputations are appropriate? As a general rule of thumb, we recommend one imputation for every % of the data that has any missing values. An easy way to visualize this can be accomplished via the `naplot` functions. We present some useful visualizations below.
+
+It is important to remember for the purpose of this visualization, to first remove from your initial dataset any columns that you do not plan on including in your model. This is because our estimate of the number of imputations is based on the fraction of subjects with missing data with which will be included in the model.
+
+```{r Number_Imputations, echo = T}
+
+# Create dataset containing only variables which will be used in modeling
+
+clin_cov <- c("BM01", "BM02", "BM03", "BM04", "BM05", "BM06", "BM07", "BM08", "BM09",
+              "BM10", "BM11", "BM12", "BM13", "BM14", "BM15", "ARM2")
+BM <- c("BM16", "BM17", "BM18")
+
+# View the % missing for each variable in your data
+na.patterns <- naclus(mod_dat)
+naplot(na.patterns, 'na per var')
+
+
+# Estimate number of imputations is necessary - 32% of data has at least one column missing.
+naplot(na.patterns, 'na per obs')
+
+# Calculate the fraction of subjects with at least 1 missing column ~ 32%
+(1638 - 1113)/1638
+
+# Another, sometimes useful, visualization
+naplot(na.patterns, "mean na")
+
+```
+
+## Imputation Model
+
+The next step is to run the multiple imputation model itself. This can be implemented via the `aregimpute` function from the `rms` package.
+
+One must include in the imputation model every covariate which one plans to include in the actual analysis, in addition to any other variables you think can be helpful for predicting any covariate with missing data.
+
+To make the function allow for nonlinearity when trying to predict missing variables, one should set `tlinear = F`. This is one advantage of the `aregimpute` function over the popular `MICE` package, which does not have this capability and forces you to assume linear relationships amongst the variables. Another advantage is that the default method applied for the imputations is Predictive Mean Matching as opposed to the `MICE` package which by default uses regular regression which is more prone to extreme imputations and less robust.
+
+One VERY important detail (although perhaps counterintuitive) is that it is important to include the outcome variable in the imputation model. Often the outcome has the strongest ability amongst the covariates in predicting the missing variables. This can only be done when performing multiple imputation (as opposed to single imputation) because the imputation process will account for the uncertainty that exists in the assumed relationship between the predictor and outcome such that there will be no deflation of the estimated standard errors as a result of using this relationship in imputing the missing covariates which will then in turn be used to estimate the relationship between the predictors and outcome. The details justifying this claim can be found in Chapter 3 in  [@moons2006using].
+
+For illustration purposes we perform only 5 imputations, although according to the above rule of thumb we should really be making 32 imputations. It is important to remember to set a seed as each imputation is based on bootstrapping sample of your data. It can also be somewhat time consuming so we recommend saving your imputation object as a .rds object to save time in the future.
+
+The imputation object will consist of 5 imputed datasets, one for each imputation. We will use this object for our models in the analysis. The coefficients from our models will reflect the average coefficient across each of the 5 imputed datasets. The standard errors are the sum of the standard error within each dataset and across the datasets.
+
+We can get a sense of the predictive accuracy of the imputations by looking at the R2 in the summary of the results from our imputation below. 
+
+
+```{r Imputation_model, echo = T}
+
+
+set.seed(4234)
+
+if(!file.exists(file.path(results, "MI5.rds"))) {
+MI5 <- aregImpute( ~ BM16 + BM17  + Outcome + BM09 + BM05 + BM18 + BM06 + BM07 + BM14 +
+                     BM08 + BM01 + BM11 + BM13 + BM12 + BM04 + BM02 + ARM2 + BM03 + BM10 +
+                     BM15,
+                    data = mod_dat, n.impute = 5, tlinear = F)
+
+saveRDS(MI5, file.path(results, "MI5.rds"))
+} else {
+  MI5 <- readRDS(file.path(results, "MI5.rds"))
+}
+
+print(MI5)
+
+```
+
+# Redundancy Analysis
+
+We now shift our focus to explore if there is a way to filter out predictors which can be easily predicted from the other predictors. It is important to bear in mind that although looking at an apparent relationship between the outcome and predictors prior to running your model can lead to overfitting and should generally (with few exceptions: one of which we have already discussed in the context of multiple imputation, another of which we will discuss below) not be done, there is no concern of overfitting by looking at the relationships amongst the predictors prior to modeling.
+
+We suggest the following algorithm to remove these "redundant" predictors:
+
+\begin{enumerate}
+\item Predict each predictor from all other predictors
+\item Remove the predictor that can be predicted with the highest R2
+\item Predict each remaining predictor from their complement
+\item Continue until no other predictor can be predicted with R2 greater than a specified threshold OR until dropping the variable with highest R2 would cause a variable dropped earlier to have R2 less than threshold
+\end{enumerate}
+
+This can all be implemented via the `redun` function from the `rms` package. Read the documentation for 2 approaches how to handle categorical predictors.  We illustrate below.  In our example, we include all covariates we wish to consider in our modeling but NOT the outcome. We set our R2 threshold to 0.6. 
+
+```{r Redundancy_analysis, echo = T}
+
+# Redundancy Analysis - No redundancies
+redun(formula = ~ BM16 +  BM18 + ARM2 + BM07 + BM15 +
+        BM08 + BM09 + BM10 + BM11 + BM12 + BM13 +
+        BM02 + BM17 + BM03 + BM04 + BM01 + BM05 + BM06, r2 = 0.6, data = mod_dat)
+
+```
+
+In our example none of our predictors met the requisite threshold, so we will include them all in our modeling.
+
+
+# Estimating How Many Degrees of Freedom (df) You Can Afford to Include in Your Model
+
+## Introduction
+
+Before you begin modeling, it is important to be aware how many terms, a.ka.a. df (where each column in your model matrix takes up 1 df), you can afford to include in your model and it to remain robust. The concern is that if you include too many terms, your model may be overfit and will not generalize well to new data. Depending on how many df you can afford to include in your model, you may be able to make less assumptions in your modeling. Some standard assumptions which you may benefit by not making include linearity and the additivity assumption (namely that there are no interactions in your model). However, to break these assumptions will require additional df. Additionally, sometimes you may have too many predictors for your sample size to produce robust estimates and depending on how many df you can afford, you may have to form clusters from some of these predictors to reduce the number of df in your model.
+
+One common mistake, is to try to perform feature selection in order to reduce the number of terms in your model. This is sometimes attempted in the form of stepwise regression. Alternatively, the analyst may first do univariable screening to filter out "unimportant" predictors. Both of these methods are not recommended. By filtering out features from the same cohort you then train your model on, you will have underestimtated standard errors and p-values, overestimated coefficients, confidence intervals that are too narrow, and overestimated performance metrics for the model (e.g. R2).
+
+Instead we recommend trying to filter out unimportant terms apriori via literature review and attempting a redundancy analysis. Beyond this, you should include all terms in your model, and as mentioned previously, if you can not afford the df, try dimension reduction via clustering. Other methods are beyond the scope of this vignette.
+
+## Effective Sample Size
+
+A simple, rough estimate for how many df you can afford to include in your model is that you can afford 1 df for roughly 10-15 **effective** samples in your data. I emphasize the term "effective" samples because it is only equal to the actual sample size of your data in the case of a continuous outcome. However, if there is a binary outcome, the effective sample size is equivalent to the min(n_0, n_1), where n_i is number of subjects for which Y = i. For example, if you have a cohort of 200 patients and you are predicting BOR where Y = {CR/PR, SD/PD}, and there is a 30% response rate, your effective sample size is 60. Therefore you can afford to include between 4-6 df in your model. For a survival outcome, the effective sample size is the number of events in your cohort.
+
+I summarize this information in the table below:
+
+Response Variable | Effective Sample Size
+----------------- |-----------------------
+Continuous        | n (total sample size)
+Binary            | min($n_0, n_1$)
+Survival Time     | Number of events
+
+When multiple imputation is used for missing data, the effective sample size will in fact be little less than the estimates above. Additionally, the above rule of thumb does not take into account the df necessary to estimate the intercept or residual variance. Therefore typically, it is recommended to have ~ 15 effective samples for every df in your model.  Shrinkage (e.g. elastice net) can help allow for a smaller ratio.
+
+In our dataset, we have 585 subjects who were primary resistant, thus we can allow for roughly `585/15 = 39` df in our analysis. However, as we will soon see, after accounting for multiple imputation, the true number of df we can afford to include will be much less.
+
+## Shrinkage Factor
+
+A more precise estimate of the number of terms you can afford is done via van Houwelingen's shrinkage factor, ${\hat\gamma}$ [@van1990predictive].  Where ${\hat\gamma} = {(model \ \chi^2 - p)}/{model \ \chi^2}$ where $p$ is the total df in your model. The model $\chi^2$ is equal to the log Likelihood Ratio for the model. If $\gamma$ falls below 0.9, for example, we may be concerned with the lack of calibration our model will experience with new data.  We can try to estimate the number of df, $q$, needed to yield  a $\gamma \ge 0.9$ via the following algorithm:
+
+\begin {enumerate}
+\item Run full "saturated" model including all terms you'd ideally like to include (including splines, interactions). Let $p$ denote the number of df in this model.
+\item Calculate ${\hat\gamma} = (LR - p)/LR$
+\item If ${\hat\gamma} > p + 9$, then reducing the number of terms can yield a better predictive model.
+\item Set $q = (LR - p)/9$
+\end {enumerate}
+
+We demonstrate below.
+
+```{r Estimating_df, echo = T}
+
+# There are a few standard overhead steps prior to modeling with the rms package.
+options(contrasts=c("contr.treatment", "contr.treatment"))
+ddist<- datadist(mod_dat, adjto.cat = "first")
+options(datadist='ddist')
+
+# First we run saturated model - Details of this code will be discussed later
+sat_mod <- fit.mult.impute(Outcome ~ rcs(BM16, 4) +  rcs(BM18, 4) + ARM2 + BM07 + BM15 +
+                          rcs(BM08, 4) + rcs(BM09, 4) + rcs(BM10, 4) + rcs(BM11, 4) + rcs (BM12, 4) +
+                          rcs(BM13, 4) + BM02 + BM17 + BM03 + rcs(BM04, 4) + BM01 + BM05 +
+                          rcs(BM06, 4) + BM16 %ia% ARM2 + BM18 %ia% ARM2,
+                          lrm, MI5, data = mod_dat)
+
+print(sat_mod)
+
+# We have a LR chi2 of ~ 468 and p = 48 df. Thus, Gamma = (468 - 48)/468 = 0.9.
+# Since Gamma >= 0.9, this implies we can keep our saturated model!
+# Had we used the heuristic rule of thumb, we would've allowed for 585/15 ~ 39 df.
+```
+
+With our current data we have enough samples to allow for the degree of flexibility we would like even without dimension reduction.  We demonstrate how to estimate q, the desired number of df on a reduced sample below. FOR ILLUSTRATION PURPOSES ONLY, we will remove all observations with missing data in order to reduce the sample size.
+
+```{r Estimating_df2, echo=T}
+
+# We will retain only observations with complete data, reducing our sample size from 1638 to 1113
+com_dat <- mod_dat[complete.cases(mod_dat),]
+
+
+# We repeat the above algorithm:
+# First we run saturated model - This time modeling directly from the data instead
+# of multiple imputation object. Details of this code will be discussed later
+sat_mod2 <- lrm(Outcome ~ rcs(BM16, 4) +  rcs(BM18, 4) + ARM2 + BM07 + BM15 +
+                          rcs(BM08, 4) + rcs(BM09, 4) + rcs(BM10, 4) + rcs(BM11, 4) +
+                  rcs (BM12, 4) + rcs(BM13, 4) + BM02 + BM17 + BM03 + rcs(BM04, 4) +
+                  BM01 + BM05 + rcs(BM06, 4) + BM16 %ia% ARM2 + BM18 %ia% ARM2,
+                data = com_dat)
+
+print(sat_mod2)
+
+# This time we have a LR chi2 of ~ 330 and p = 48 df.
+# Thus, Gamma = (330 - 48)/330 = 0.85.
+# Since Gamma < 0.9, this implies we need to improve our model by reducing the number
+# of df it includes.
+# We solve for q: (LR - p)/9 = (330 - 48)/9 = 31.3.
+# Thus we can safely include 31-32 df in our model.
+```
+
+# Spending Your Degrees of Freedom
+
+Based on the information above, we can only include 31-32 df in our model instead of our ideal 48. Therefore we will have to make some difficult decisions. Suppose we decide to do away with any interactions (2*3 df = 6 df). This would reduce our ideal model to 48 - 6 = 42 df. We still have to reduce our model further. The next step would be to then prioritize which variables we allow to be non-linear. For simplicity, assuming we decide to keep the number of knots in each cubic spline at 4 (3 df), this would allow us to have 4 continuous predictors with cubic splines, the rest constrained to be linear.
+
+In order to choose which predictors to allow flexibility for, we suggest prioritizing the most important ones, where important terms are the ones most strongly associated with the response variable `Outcome`. This may sound counterintuitive considering our strong warning against using the outcome to perform feature selection above (section 5.1). However, @harrell2015regression asserts that since there is no reason to assume the degree of non-linearity should be associated with the strength of association with y, this approach has the potential to hurt your model just as it can improve it and therefore does not lead to overfitting. However, this approach serves to prevent big mistakes and only allow for small ones.
+
+In order to rank the predictors, we will first run a saturated (and overfit) model allowing every continuous predictor to be a cubic spline with 4 knots.  We will then choose the 4 predictors with the strongest associations to retain cubic splines, the rest will be constrained to be linear.
+
+We demonstrate below.
+
+```{r Prioritizing_non_linear, echo = T}
+
+# First we run a saturated model
+sat_mod3 <- lrm(Outcome ~ rcs(BM16, 4) +  rcs(BM18, 4) + ARM2 + BM07 + BM15 +
+                rcs(BM08, 4) + rcs(BM09, 4) + rcs(BM10, 4) + rcs(BM11, 4) + rcs (BM12, 4) + rcs(BM13, 4) +
+                BM02 + BM17 + BM03 + rcs(BM04, 4) + BM01 + BM05 + rcs(BM06, 4),
+                data = com_dat)
+
+# Then we visualize the ranks of the predictors - NOT LOOKING at tests for non-linearity
+plot(anova(sat_mod3))
+
+# The 4 continuous predictors with the greatest strengths of association are BM18, BM04, BM12, and BM16.
+# The rest we will constrain to be linear.
+# We now fit our final (reduced) model
+
+red_mod <- lrm(Outcome ~ rcs(BM16, 4) +  rcs(BM18, 4) + ARM2 + BM07 + BM15 +
+                             BM08 + BM09 + BM10 + BM11 + rcs(BM12, 4) + BM13 +
+                             BM02 + BM17 + BM03 + rcs(BM04, 4) + BM01 + BM05 + BM06,
+                data = com_dat)
+
+```
+
+
+# Dimension Reduction
+
+Suppose you do not have enough df to fit all of the predictors from your data into the model. In this case it is necessary to first perform some sort of dimension reduction prior to modeling. One way to accomplish this is via clustering.
+
+We illustrate below.
+
+```{r Clustering, echo = T}
+
+# For illustration purposes, we will remove half of our observations from our original cohort
+set.seed(123)
+index <- sample(nrow(mod_dat), size = nrow(mod_dat)/2, replace = F)
+half <- mod_dat[index,]
+
+# We use rule of thumb to estimate df we can afford. Here we have effective sample
+# size of 309 therefore 309/15 = 21 df. We definitely need major dimension reduction.
+describe(half$Outcome)
+
+# Here we perform multiple imputation via the transcan function
+# It has a different algorithm than aregimpute. Generally aregimpute is preferred
+# However, transcan also transforms variables to optimize correlation between variables
+# This is useful for dimension reduction via clustering 
+nimp <- 20
+ptrans <- transcan(~ BM16 +  BM18 + ARM2 + BM07 + BM15 +
+                             BM08 + BM09 + BM10 + BM11 + BM12 + BM13 +
+                             BM02 + BM17 + BM03 + BM04 + BM01 + BM05 + BM06,
+                imputed = T, transformed = T, trantab = T, pl = F, show.na = T, data = half,
+                n.impute = nimp, pr = F)
+
+summary(ptrans, digits = 4)
+
+# Setting scale = T scales transformed values to [0,1] before plotting
+ggplot(ptrans, scale = T)
+
+# Cluster variables
+vc <- varclus(~ BM16 +  BM18 + ARM2 + BM07 + BM15 +
+                             BM08 + BM09 + BM10 + BM11 + BM12 + BM13 +
+                             BM02 + BM17 + BM03 + BM04 + BM01 + BM05 + BM06,
+              data = half)
+
+plot(vc)
+
+# Make list of each imputed dataset (without transformations)
+half_tr <- list()
+for(i in 1:nimp){
+half_tr[[i]] <- impute.transcan(ptrans, imputation = i,  data = half, list.out = T)
+half_tr[[i]] <- as.data.frame(half_tr[[i]])
+}
+
+# Sample raw imputed dataset
+# We will perform Principal Component Analysis on this dataset
+imp1 <- half_tr[[1]]
+
+# Clustering of imputed, transformed data
+# This can be helpful to manually assign clusters to variables
+vc_tr <- varclus(ptrans$transformed,
+              data = imp1)
+
+plot(vc_tr)
+
+# Based on diagram, lets make the following clusters:
+# 1) BM13, BM04
+# 2) BM02, BM05, BM18, BM08
+# 3) BM11, BM03
+# 4) BM17, BM06
+# 5) Other - don't cluster
+
+# We will then take 1st principal component from each cluster and model it
+# Make function to compute first princ comp from given cluster
+pco <- function(v, data_tr) {
+f <-  princomp(data_tr[,v], cor=TRUE)
+vars  <-  f$sdev^2
+cat( 'Fraction of variance explained by PC1:',
+round(vars[1]/sum(vars ),2), ' \n ')
+f$scores[,1]
+}
+
+cluster1 <-  pco(v = c( 'BM13' , 'BM04'), data_tr = ptrans$transformed)
+cluster2 <- pco(v =c("BM02", "BM05", "BM18", "BM08"), data_tr = ptrans$transformed)
+cluster3 <- pco(v =c("BM11", "BM03"), data_tr = ptrans$transformed)
+cluster4 <- pco(v =c("BM17", "BM06"), data_tr = ptrans$transformed)
+cluster5 <- ptrans$transformed[, c("BM12", "BM01", "BM16", "BM15", "BM07", "ARM2", "BM10", "BM09")]
+
+# Run model
+Y <- half$Outcome
+f_clust <- lrm(Y ~ cluster1 + cluster2 + cluster3 + cluster4 + cluster5, x = T, y = T)
+AIC_clust <- AIC(f_clust)
+
+# Principal Component Analysis (PCA)
+# We take out treatment since that will be added separately to model
+
+# First we transform categorical variables to numeric
+BM05_num <- model.matrix(~ BM05, data = imp1)[, -1]
+BM07_num <- model.matrix(~ BM07, data = imp1)[, -1]
+BM17_num <- model.matrix(~ BM17, data = imp1)[, -1]
+BM03_num <- model.matrix(~ BM03, data = imp1)[, -1]
+BM01_num <- model.matrix(~ BM01, data = imp1)[, -1]
+
+# Calculate principal components
+prin.raw <- princomp(~ BM16 +  BM18 + BM07_num + BM15 +
+                             BM08 + BM09 + BM10 + BM11 + BM12 + BM13 +
+                             BM02 + BM17_num + BM03_num + BM04 + BM01_num + BM05_num + BM06,
+                     cor = T, data = imp1)
+
+# Make scree plot of PCA on transformed variables
+plot (prin.raw , type = 'lines' , main = '', ylim = c(0, 3))
+
+# Make function to add cumulative variance explained to scree plot
+addscree <- function (x, npcs=min(10, length (x$sdev)),
+plotv =FALSE, col=1, offset =.8 , adj=0, pr=FALSE) {
+vars <- x$sdev^2
+cumv <-  cumsum (vars)/sum(vars)
+if(pr) print (cumv)
+text(1:npcs , vars[1:npcs] + offset*par('cxy')[2],
+as.character(round(cumv [1:npcs], 2)),
+srt=45, adj=adj , cex=.65 , xpd=NA , col=col)
+if(plotv) lines(1:npcs, vars[1: npcs], type = 'b' , col=col)
+}
+
+addscree (prin.raw)
+
+# Calculate PCA for transformed variables
+prin.trans <- princomp(ptrans$transformed, cor = T)
+addscree(prin.trans, npcs = 10, plotv = T, col = "red",
+         offset = -0.8, adj = 1)
+
+# Assess how many PCs to include
+
+pcs_raw <- prin.raw$scores
+aic_raw <- rep(NA, ncol(prin.raw$scores))
+for (i in seq_len(ncol(prin.raw$scores))) {
+  ps <- pcs_raw[,seq_len(i)]
+  aic_raw[i] <- AIC(lrm(half$Outcome ~ ps + ptrans$transformed[, "ARM2"]))
+}
+
+
+# plot (seq_len(ncol(prin.raw$scores)), aic , xlab= 'Number of Components Used' ,
+# ylab = 'AIC' , type= 'l', ylim = c(900, 1000))
+
+
+pcs_tr <- prin.trans$scores
+aic_tr <- rep(NA, length(aic_raw))
+for (i in seq_len(ncol(prin.trans$scores))) {
+  ps <- pcs_tr[,seq_len(i)]
+  aic_tr[i] <- AIC(lrm(half$Outcome ~ ps))
+}
+# lines(seq_len(ncol(prin.trans$scores)), aic_tr, col = "red")
+
+# aicpl <- data.frame(x=seq_len(length(aic)), aic = aic)
+# ggplot(aicpl, aes(x = x, y = aic)) +
+#   geom_line() +
+#   xlab("Number of Components Used") +
+#   ylab("AIC") +
+#   scale_x_continuous(breaks = seq_len(nrow(aicpl))) +
+#   ylim(950, 1050)
+
+
+f_full <- lrm(Y ~ BM16 +  BM18 + BM07_num + BM15 +
+                             BM08 + BM09 + BM10 + BM11 + BM12 + BM13 +
+                             BM02 + BM17_num + BM03_num + BM04 + BM01_num + BM05_num +
+                BM06 + ARM2, data = imp1, x = T, y = T)
+
+f_spline <- lrm(Y ~ BM16 +  rcs(BM18, 4) + BM07_num + BM15 +
+                  rcs(BM08, 4) + rcs(BM09, 4) + rcs(BM10, 4) + rcs(BM04, 4) + BM01_num +
+                  rcs(BM11, 4) + rcs(BM12, 4) + rcs(BM13, 4) + BM02 + BM17_num + BM03_num + 
+                  BM05_num + rcs(BM06, 4) + ARM2, data = imp1, x = T, y = T)
+
+AIC_full <- AIC(f_full)
+AIC_spline <- AIC(f_spline)
+# abline (h=AIC(f), col= 'blue')
+
+
+# Compare to Sparse PCA
+s <- sPCAgrid(ptrans$transformed, k = 10, method = "sd",
+              center = mean, scale = sd, scores = T)
+
+plot(s, type = 'lines' , main= '' , ylim =c(0,3))
+addscree(s)
+s$loadings
+
+
+pcs_s <- s$scores
+aic_s <- rep(NA, length(aic_raw))
+for (i in seq_len(ncol(s$scores))) {
+  ps <- pcs_s[, seq_len(i)]
+  aic_s[i] <- AIC(lrm(Y ~ ps))
+}
+
+# Choose optimal number of components for each method
+# Minimal risk of overfitting since selection is performed in prespecified, rigid order
+# (see RMS book pg 170)
+# We include reference lines for full linear (blue) and spline (red) models
+aicpl <- data.frame(x=seq_len(length(aic_raw)), aic_raw = aic_raw, aic_tr = aic_tr, aic_s = aic_s)
+aic_long <- pivot_longer(aicpl, starts_with("aic"), names_to = "Method", values_to = "AIC")
+
+ggplot(aic_long, aes(x = x, y = AIC, color = Method)) +
+  geom_line() +
+  xlab("Number of Components Used") +
+  ylab("AIC") +
+  scale_x_continuous(breaks = seq_len(nrow(aicpl))) +
+  geom_hline(yintercept = AIC_full, color = "blue") +
+  geom_hline(yintercept = AIC_spline, color = "red") +
+  geom_hline(yintercept = AIC_clust, color = "green")
+  # ylim(950, 1050)
+
+
+# Validate each method to compare performance
+# Running pca with 10 components for raw data
+ps_raw <- pcs_raw[,seq_len(10)]
+f_raw <- lrm(half$Outcome ~ ps_raw, x = T, y = T)
+
+# Running pca with 10 components for transformed data
+ps_tr <- pcs_raw[,seq_len(15)]
+f_tr <- lrm(half$Outcome ~ ps_tr, x = T, y = T)
+
+# Running pca with 6 components for sparse PCA
+ps_s <- pcs_s[, seq_len(6)]
+f_s <- lrm(half$Outcome ~ ps_s + ptrans$transformed[, "ARM2"], x = T, y = T)
+
+# Compare performance across methods
+validate(f_raw, B = 100)
+validate(f_full, B = 100)
+validate(f_spline, B = 100)
+validate(f_tr, B = 100)
+validate(f_s, B = 100)
+validate(f_clust, B = 100)
+
+```
+
+# Ordinal Regression Case Study with Dimension Reduction
+
+As eluded to earlier, when working with a binary outcome your effective sample size is at best 50% of the effective sample size had the outcome been continuous. It certainly stands to reason that if one has a multinomial outcome it would be inefficient to convert the multinomial outcome into binary. A common example where this is done is with BOR, where analysts will typically take a 4-level outcome and split it into 2 levels (CR/PR vs SD/PD). We provide an example below of an analysis where we keep the outcome in its original 4-level form, thus preserving the efficiency of our analysis.
+
+```{r Getting_ordinal_Data, echo = F}
+
+# Here we create the dat_ord dataset which is the same as mod_dat except that it includes BOR
+dat_ord <- readRDS(file.path(results, "Anonymized_ord_dat.rds"))
+```
+
+```{r Ordinal_Analysis, echo = T}
+
+# Turn BOR into ordinal factor
+dat_ord$BOR_CONF <- factor(dat_ord$BOR_CONF, ordered = T, levels = c("PD", "SD", "PR", "CR"))
+
+
+# Describe dataset
+# options(contrasts=c("contr.treatment", "contr.treatment"))
+ddist<- datadist(dat_ord, adjto.cat = "first")
+options(datadist='ddist')
+
+describe(dat_ord)
+
+# Here we apply single imputation due to minimal missing
+ord_scan <- transcan(~ BM18 + ARM + BM07 + BM15 +
+                             BM08 + BM09 + BM10 + BM11 + BM12 + BM13 +
+                             BM02 + BM03 + BM04 + BM01 + BM05 + BM06,
+                imputed = T, transformed = T, trantab = T, pl = F, show.na = T, data = dat_ord,
+                n.impute = 1, pr = F)
+
+ord_imp <- data.frame(impute.transcan(ord_scan, imputation = 1,  data = dat_ord, list.out = T))
+BOR <- dat_ord$BOR_CONF
+
+ord_imp <- data.frame(ord_imp, BOR = BOR)
+  
+# Plot clusters
+vclust <- varclus(ord_scan$transformed, data = ord_imp)
+
+plot(vclust)
+
+# Make clusters
+# 1) BM02, BM05
+# 2) BM18, BM08
+# 3) BM13, BM04
+# 4) BM11, BM03
+# 5) Other
+
+# Calculate 1st princ comp from each cluster (except other)
+cluster1 <- pco(v = c("BM02", "BM05"), data_tr = ord_scan$transformed)
+cluster2 <- pco(v = c("BM18", "BM08"), data_tr = ord_scan$transformed)
+cluster3 <- pco(v = c("BM13", "BM04"), data_tr = ord_scan$transformed)
+cluster4 <- pco(v = c("BM11", "BM03"), data_tr = ord_scan$transformed)
+cluster5 <- ord_scan$transformed[,c("ARM", "BM12", "BM15", "BM01", "BM09", "BM06", "BM07", "BM10")]
+
+ddist<- datadist(ord_imp, adjto.cat = "first")
+options(datadist='ddist')
+
+# Run ordinal logistic regression model
+mod_ord <- lrm(BOR ~ cluster1 + cluster2 + cluster3 + cluster4 + cluster5, data = ord_imp)
+
+
+plot(anova(mod_ord))
+print(mod_ord)
+# p_ord <- Predict(mod_ord)
+```
+# Visualizing Results
+
+Now that we have our model, the next step is to provide helpful visualizations of the results. In particular we recommend 3 helpful visualizations:
+
+\begin {enumerate}
+\item \underline{Anova plot} - Useful for ranking strengths of association amongst predictors. By default the X-axis is the $\chi^2 - df$ which should equal 0 under $H_0: \beta = 0$. This provides more information than the p-value since it gives a greater sense of distinction between "significant" predictors. See `?plot.anova.rms` for more information.
+\item \underline{Partial Effects plot} - Useful for visualizing the direction and form of the relationship between each predictor and outcome while adjusting for all other predictors. By default all other continuous predictors are set to median value and categorical predictors are set to their reference value. See `?ggplot.Predict` for more information.
+\item \underline{Nomogram} - Provides high level overview of relationships between variables and response. Allows you to convert the scale from "prediction score" to probability of response on an individual patient level. Clinicians tend to have strong preference for this visualization. See `?rms.nomogram` for more information.
+\end{enumerate}
+
+We illustrate these visualizations below using the model built on the multiply imputed dataset from above.
+
+Note that we use `fit.mult.impute` to run the model on the multiple imputed data. We include `fitter = lrm` as an argument telling the function to perform logistic regression. We also include `xtrans = MI5` telling it to use the `MI5` object we created from `aregimpute` above (section 3.3). Finally, we include `data = mod_dat` telling the function which dataset we used to derive the `xtrans` object.
+
+```{r Visualizing_Results, echo = T}
+
+ddist<- datadist(mod_dat, adjto.cat = "first")
+options(datadist='ddist')
+
+# For the multiple imputed data, we use fit.mult.impute
+sat_mod <- fit.mult.impute(Outcome ~ rcs(BM16, 4) +  rcs(BM18, 4) + ARM2 + BM07 + BM15 +
+                             rcs(BM08, 4) + rcs(BM09, 4) + rcs(BM10, 4) + rcs(BM11, 4) +
+                             rcs (BM12, 4) + rcs(BM13, 4) +
+                             BM02 + BM17 + BM03 + rcs(BM04, 4) + BM01 + BM05 + rcs(BM06, 4) +
+                             BM16 %ia% ARM2 + BM18 %ia% ARM2,
+                           fitter = lrm, xtrans = MI5, data = mod_dat)
+
+# ANOVA Plot - We can now visualize the results including the test for non-linearity
+# to convince our collaborators that it was worth allowing for BUT NOT to influence
+# our decision whether or not to include non-linear terms
+a_sat <- anova(sat_mod)
+
+# You can also visualize the anova output in text form 
+# This is much more clear (and useful) of a summary than that provided by summary(model)
+print(a_sat)
+print(plot(a_sat, rm.totals = F, rm.other = "TOTAL"))
+
+# Partial Effects Plot - We use ref.zero = T to plot the log(OR) relative to median
+# instead of relative odds for each predictor.
+# This therefore constrains each facet to have log(OR) = 0 at the median for each predictor.
+# Due to the many predictors, we also separate the continuous from the categorical
+# predictors into 2 distinct plots via setting sepdiscrete = "list"
+# This plot uses ggplot, so we can customize it via regular ggplot sintax as illustrated below
+pred_red <- Predict(sat_mod, ref.zero = T)
+p_pe_red <- ggplot(pred_red, vnames = "names", sepdiscrete = "list", anova = a_sat, pval = T)
+
+# Continuous partial effects plot
+p_pe_red_cont <- p_pe_red$continuous +
+ggtitle("Prognostic Full Model (9 Trials)") +
+geom_hline(yintercept = 0, linetype = "dashed") +
+ylab("Log Odds Ratio of Primary Resistance (Relative to Median)")
+
+print(p_pe_red_cont)
+
+# Example of Partial Effects Plot with Interaction
+# Here we allowed for interaction between BM18 and Arm
+# so we view that plot individually (since not all terms in model have interactions)
+pred_intBM18 <- Predict(sat_mod, BM18, ARM2, ref.zero = T)
+p_pe_BM18 <- ggplot(pred_intBM18, vnames = "names", anova = a_sat, pval = T)
+
+p_pe_BM18 <- p_pe_BM18 +
+ggtitle("Prognostic Full Model (9 Trials)") +
+geom_hline(yintercept = 0, linetype = "dashed") +
+ylab("Log Odds Ratio of Primary Resistance (Relative to Median)")
+
+print(p_pe_BM18)
+
+# Categorical partial effects plot
+p_pe_red_disc <- p_pe_red$discrete +
+  ggtitle("Prognostic Full Model (9 Trials)") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  xlab("Log Odds Ratio of Primary Resistance")
+
+print(p_pe_red_disc)
+
+# Partial Effects Plot with interaction
+
+
+# Nomogram
+plot(nomogram(red_mod))
+```
+
+# Performance Evaluation via Internal Validation
+
+It is of utmost importance to assess the performance of your model in a generalizable, robust way. That means not to simply use the performance metrics from the data you used to train your model. In an ideal world, you would have an external dataset that became available just as you finished your analysis for you to validate your model on (if it became available before you finished your analysis it would be preferable to use all available data in training your model). This would be known as external validation and is the gold standard of validation. However, considering that is not the case, in general we recommend one of two ways to perform internal validation:
+
+\begin{enumerate}
+\item Optimism-adjusted bootstrap
+\item Repeated Cross-validation (CV)
+\end {enumerate}
+
+The following is the algorithm used in the optimism-adjusted bootstrap:
+\begin {enumerate}
+\item Run full model on all of data
+\item Determine performance metrics on full model
+\item Draw bootstrap sample (with replacement) Build model on bootstrap sample and Calculate “apparent” performance on same bootstrap sample
+\item Apply model from bootstrap sample on original (full) data
+\item Calculate Optimism by subtracting difference between performance metric Calculated in step 3 from that Calculated in step 4
+\item After repeating steps 3 – 5 many times, Calculate average amount of optimism
+\item Subtract average optimism from performance metric Calculated in step 2
+\end {enumerate}
+
+Although intuitively there is some leakage in step 4 since on average 63.2% of data from full model is in each bootstrap sample as well, nonetheless both @harrell2015regression and @steyerberg2019clinical assert this method of internal validation has strong basis both in theory and based on many simulations.
+There are also 2 reasons to prefer this method over repeated CV:
+
+\begin {enumerate}
+\item It's easier to validate with imputed data
+\item It uses the full dataset and therefore you can expect a more realistic estimate to true model performance whereas the estimate from repeated CV is a conservative one since it's based on a model built from only a fraction of the data
+\end{enumerate}
+
+Combining internal validation with multiple imputation is a challenging problem. Here we take the approach of @steyerberg2019clinical to perform an optimism-adjusted bootstrap for each imputed dataset. We then report the mean and distribution of the performance metrics across all imputed datasets.
+
+The `rms` package makes it simple to implement the optimism-adjusted bootstrap. We demonstrate below.
+
+```{r Validation, echo = T}
+
+# First we set a seed
+set.seed(4155)
+
+# This can be time consuming, so we save our output as an rds object
+if(!file.exists(file.path(results, "PubDcomplete9.rds"))) {
+full <- list()
+mod <- list()
+val <- list()
+for (i in seq_len(MI5$n.impute)) {
+
+  # Pull out each imputed dataset from our MI5 object. See ?impute.transcan for more details.
+full[[i]] <- as.data.frame(impute.transcan(MI5, imputation=i, data=mod_dat,
+                                           list.out=TRUE, pr=FALSE, check=FALSE))
+
+# As above, we tell the rms package the distribution of our data
+ddist<- datadist(full[[i]], adjto.cat = "first")
+options(datadist='ddist')
+
+# We run the same model as above, however this time via the lrm function since we are
+# looking at only one dataset at a time instead of all of them together
+# We set x = T, y = T so that the model object will include the matrix of predictors (x)
+# and response (y), this is necessary for the validation steps which follow
+mod[[i]] <- lrm(Outcome ~ rcs(BM16, 4) +  rcs(BM18, 4) + ARM2 + BM07 + BM15 +
+                  rcs(BM08, 4) + rcs(BM09, 4) + rcs(BM10, 4) + rcs(BM11, 4) +
+                  rcs (BM12, 4) + rcs(BM13, 4) +
+                  BM02 + BM17 + BM03 + rcs(BM04, 4) + BM01 + BM05 + rcs(BM06, 4) +
+                  BM16 %ia% ARM2 + BM18 %ia% ARM2, data = full[[i]], x = T, y = T)
+
+# Calculate various performance metrics for our model via optimism-adjusted bootstrap.
+# For illustration purposes we set B = 50 bootstrap samples.
+# In practice it may be preferable to set B to a higher number, e.g. B = 500.
+val[[i]] <- validate(mod[[i]], B = 50)
+}
+complete9 <- list(full = full, mod = mod, val = val)
+saveRDS(complete9, file.path(results, "PubDcomplete9.rds"))
+} else {
+  complete9 <- readRDS(file.path(results, "PubDcomplete9.rds"))
+  
+  # "full" is a list of the individual imputed datasets used in validation
+  full <- complete9$full
+  
+  # "mod" is a list of model outputs corresponding to each dataset
+  mod <- complete9$mod
+  
+  # "val" is a list of performance metric summaries corresponding to each dataset
+  val <- complete9$val
+}
+
+# View a sample output from the validate function
+print(val[[1]])
+```
+
+We now have created `val` a list of performance metric summaries corresponding to each dataset. we now illustrate below how to pull out any individual performance metric and show its distribution across the multiple imputed datasets. This serves as a sort of sensitivity analysis to see how much the performance varies across imputed datasets. We will illustrate with $R^2$. We also like to see the estimate for optimism to get a sense how overfit the model is.
+
+```{r R2, echo = T}
+
+R2 <- data.frame(Optimism = rep(NA, MI5$n.impute), Corrected = rep(NA, MI5$n.impute))
+for(i in seq_len(MI5$n.impute)) {
+  R2$Corrected[i] <- val[[i]]["R2", "index.corrected"]
+  R2$Optimism[i] <- val[[i]]["R2", "optimism"]
+}
+median(R2$Corrected)
+
+print(densityplot(R2$Corrected, xlab = "R2",
+            main = "Distribution of Optimism-Corrected R2 Across 5 Imputated Datasets"))
+median(R2$Optimism)
+```
+
+# Cox Regression with Interaction
+
+``` {r Load_data, echo = F}
+surv_dat <- readRDS(file.path(results, "Anonymized_surv_dat.rds"))
+```
+
+Here we give a brief example of running a cox model on a continuous biomarker interacting with treatment, with partial effects plot via the `rms` package. We illustrate using the `surv_dat` dataset.
+
+``` {r cox_model, echo = T}
+
+library(rms)
+
+# Here we inform the rms package of the distribution of our dataset to aid in visualizations
+ddist<- datadist(surv_dat, adjto.cat = "first")
+options(datadist='ddist')
+
+# We provide a description of the data
+describe(surv_dat)
+
+# We run a cox model using restricted cubic spline for BM16 with 5 knots and
+# interaction with Treatment (ARM)
+
+mod <- cph(Surv(OS_CONF, 1 - OSCENSOR) ~ rcs(BM01, 5) * ARM, data = surv_dat)
+
+# We make Prediction matrix and plot partial effects plot
+surv_preds <- Predict(mod, BM01, ARM)
+surv_plot <- ggplot(surv_preds)
+print(surv_plot)
+```
+
+# References
+
+<!-- From https://stackoverflow.com/questions/41532707/include-rmd-appendix-after-references
+ div tells Pandoc to include the refs here, rather than at the end of the document. -->
+ 
+<div id="refs"></div>
+
+\newpage
+
+# System Information
+
+***Time required to process this report:*** *`r format(Sys.time() - startTime)`*
+
+***R session information:***
+
+```{r, echo_session_info}
+sessionInfo()
+```
+
+```{r, domino, results="asis"}
+if (Sys.getenv("DOMINO_WORKING_DIR") != "") {
+  cat(paste("\n\n## Domino environment details",
+            paste("**Domino User:**", Sys.getenv("DOMINO_PROJECT_OWNER")),
+            paste("**Domino Project:**", Sys.getenv("DOMINO_PROJECT_NAME")),
+            paste("**Domino Run ID:**", Sys.getenv("DOMINO_RUN_ID")),
+            paste("**Domino Run #:**", Sys.getenv("DOMINO_RUN_NUMBER")),
+            sep="\n\n"))
+}
+```
