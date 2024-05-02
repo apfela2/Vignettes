@@ -1,0 +1,1348 @@
+---
+title: |
+  Vignette for Modeling Interactions with Treatment in High Dimensions: Binary Outcome
+author: '[Abraham Apfel](mailto:abraham.apfel2@gmail.com)'
+date: '`r format(Sys.time(), "%A, %B %e, %Y")`'
+output:
+  html_document:
+    toc: yes
+    toc_depth: '4'
+    df_print: paged
+  pdf_document:
+    toc: yes
+    toc_depth: 4
+    number_sections: yes
+csl: "references/elsevier-harvard2.csl"
+bibliography:
+- references/grp_lasso.bib
+- references/google_scholar_library.bib
+- references/online_resources.bib
+- references/pubmed_export_with_cite_key_reformatted.bib
+- references/r_citations.bib
+---
+
+```{r, echo=FALSE, message=FALSE}
+# Free up memory by forcing garbage collection
+invisible(gc())
+# Manually set the seed to an arbitrary number for consistency in reports
+# Fun seed: https://en.wikipedia.org/wiki/Fast_inverse_square_root#Overview_of_the_code
+set.seed(0x5F3759DF, kind="Mersenne-Twister", normal.kind="Inversion")
+
+startTime <- Sys.time()
+```
+
+```{r global_options, include=FALSE}
+# use include=FALSE to have the chunk evaluated, but neither the code nor its output displayed.
+knitr::opts_chunk$set(echo=FALSE, message=FALSE,
+                      error=FALSE,  # Stop when encountering an error
+                      fig.align="center", fig.width=12, fig.height=8, fig.path='figs/', 
+                      dev=c('png')) # output figures as png (for HTML report)
+```
+
+```{r, load_libraries_setwd}
+library(conflicted)  # forces double colon references for functions that appear in multiple packages
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(tibble)
+library(tidyr)
+
+# For functions that appear in multiple packages, specify which one we want.
+conflict_prefer("filter", "dplyr")
+conflict_prefer("rename", "dplyr")
+conflict_prefer("select", "dplyr")
+
+if ("rstudioapi" %in% installed.packages()[, "Package"] & rstudioapi::isAvailable() & interactive()) {
+  # When in RStudio, dynamically sets working directory to path of this script
+  setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+  # Set the default ggplot theme to "theme_bw" with default font size
+  theme_set(theme_bw())
+} else {
+  # Set the default ggplot theme to "theme_bw" with specified base font size
+  theme_set(theme_bw(20))
+}
+```
+
+
+
+# Purpose
+
+
+The purpose of this vignette is to offer a guidance for colleagues looking to
+discover biomarkers whose association with an outcome may differ by treatment arm.
+We particularly focus on the high dimensional setting, however many of these ideas
+are easily applicaple to a low dimensional setting as well.
+
+Much of this vignette is similarly covered in another vignette made for when there
+is a survival outcome (https://github.com/apfela2/Vignettes/Vignette_grpLasso_Survival)
+however there are some differences. In particular,
+there is a different function used to run the group lasso regression (and consequently
+different wrapper functions). Here we also demonstrate an example where we use standard
+dummy coding for treatment as opposed to +1/-1 coding, as is discussed in the vignettes.
+
+In this vignette we will cover parameterizing your model in a way to focus on identifying biomarkers
+which interact with treatment, on the importance of using splines when investigating interactions,
+and our recommended approach to model certain biomarkers where there seems to be a point of discontinuity.
+We also focus on several challenges unique to the penalized regression setting such as
+including splines and interactions, scaling continuous variables appropriately for proper
+inference when categorical variables are also present, and appropriate visualizations.
+
+# Dataset
+
+We used data from 9 clinical trials which were made up of 1,137 patients who were evaluable
+for Outcome and received one of 2 possible treatments (initial cohort of 1,803).
+Out of the 1,137 patients in our analysis, 337 were positive for the binary outcome of interest ("Outcome"). Thus leaving us with an
+effective sample size of 337. See Vignette on Regression Modeling Strategies
+(https://github.com/apfela2/Vignettes/Vignette_Regression_Strategies) for
+more information on calculating and how to best make use of effective sample size.
+
+The goal of our analysis was to discover if any biomarkers, from a pre-selected list of 18,
+differ in their association with "Outcome" by treatment.
+
+
+# Setting up Your Data
+
+## Scaling
+
+The first step we do after loading our data is to scale all continuous variables by 2 times
+the standard deviation (instead of the more typically applied 1 times the sd). This is in
+order to allow the continuous variables to be on the same scale as the categorical ones.
+See [@gelman2008scaling].
+
+Note due to the complexity of the analysis beyond the scope of this vignette, we had to
+develop several models and thus I needed to run a Config file to help reduce redundant
+coding. Thus the code I present below makes use of one of the Config files for which I share
+the code below.
+
+``` {r Config_File, echo = T}
+
+library(bmsPURR)
+# library(GGally)
+library(corrplot)
+# library(mice)
+# library(lme4)
+library(rms)
+library(rmsb)
+library(parallel)
+# library(doParallel)
+# library(glinternet)
+# library(TunePareto)
+# library(survivalROC)
+# library(survcomp)
+# library(timeROC)
+library(grpreg)
+# library(CalibrationCurves)
+# library(splines)
+# library(ellipse)
+library(tidyverse)
+
+# Config File: 
+
+yimp <- "No"
+lab_yimp <- "NoY_"
+
+simon <- "No"
+lab_simon <- "NoSimon"
+
+ver <- "v01"
+
+priorI <- "No"
+lab_priorI <- "NoPriorI_"
+```
+
+```{r Load_data, echo = F}
+
+# File Paths
+
+
+results <- "/stash/results/dev/apfela/P03632_Regression_Strategies_Vignette"
+imp_dat <- readRDS("/stash/results/dev/apfela/P05766_Vignette_grplasso_Binary/Anonymized_dat.rds")
+
+```
+
+```{r scale_data, echo = T}
+
+describe(imp_dat)
+
+
+cont_bm <- c("Cont01", "Cont02", "Cont03", "Cont04", "Cont05", "Cont06",
+                         "Cont07", "Cont08", "Cont09", "Cont10")
+cat_bm <- c("Cat01", "Cat02", "Cat03", "Cat04", "Cat05", "Cat06", "Cat07", "Cat08")
+trt <- "ARM2"
+
+# Capture mean and sd for purpose of external validation
+means <- apply(imp_dat[, cont_bm], 2, mean, na.rm = T)
+sds <- apply(imp_dat[, cont_bm], 2, sd, na.rm = T)
+
+# Create new data frame with means and standard deviations
+mean_sd <- data.frame(variable = cont_bm, mean = means, sd = sds)
+
+scale2 <- function(x) {
+  (x - mean(x, na.rm = T))/(2*sd(x, na.rm = T))
+}
+
+# Fix up data
+
+imp_dat <- mutate_at(imp_dat, cont_bm, list(s = ~scale2(.)))
+cont_bm <- paste0(cont_bm, "_s")
+
+
+```
+
+## Imputation
+
+
+We then use single imputation WITHOUT using outcome for
+missing data. This is a conservative approach. If we would use multiple imputation
+we would be able to use the outcome as part of the imputation model but due to complexities
+with combining multiple imputation with penalized regression we opt for the simpler,
+conservative approach of single imputation without the outcome in the imputation model.
+
+See Regression Modeling Strategies vignette
+(https://github.com/apfela2/Vignettes/Vignette_Regression_Strategies) for more details
+about best imputation practices.
+
+```{r Removing_NE, echo = T}
+
+
+# Perform single imputation WITHOUT using outcome: conservative approach
+
+# Explore missing patterns
+na.patterns <- naclus(imp_dat)
+naplot(na.patterns)
+imp_dat$numvar_missing <- na.patterns$na.per.obs
+
+# # Remove subjects missing on >=5 variables (3 subjects)
+red_dat <- filter(imp_dat, numvar_missing <= 7)
+
+na.patterns <- naclus(red_dat)
+naplot(na.patterns)
+
+if(yimp == "No"){
+naplot(na.patterns, "na per var")
+mtext("Single Imputation: No Y", side = 3)
+} else if(yimp == "Yes"){
+  naplot(na.patterns, "na per var")
+  mtext("Single Imputation: With Y", side = 3)
+}
+
+# Explore correlation of continuous biomarkers
+describe(red_dat)
+
+num_dat <- as.matrix(dplyr::select(red_dat, cont_bm))
+
+cor_mat <- rcorr(num_dat)
+
+corrplot.mixed(cor_mat$r, lower = "ellipse", upper = "number", tl.pos = "lt")
+
+
+
+red_dat <- dplyr::select(red_dat, -numvar_missing)
+
+
+set.seed(122)
+if (yimp == "No"){
+MI <- aregImpute( ~ Cont09_s + Cat08  + Cont04_s + Cat04 + Cont10_s + Cont02_s + Cat05 + Cat06 +
+                    Cont03_s + Cat01 + Cont06_s + Cont08_s + Cont07_s + Cont01_s + Cat02 + ARM2 + Cat03 + Cont05_s +
+                    Cat07,
+                  data = red_dat, n.impute = 1, tlinear = F)
+} else if (yimp == "Yes"){
+  MI <- aregImpute( ~ Outcome + Cont09_s + Cat08  + Cont04_s + Cat04 + Cont10_s + Cont02_s + Cat05 + Cat06 +
+                      Cont03_s + Cat01 + Cont06_s + Cont08_s + Cont07_s + Cont01_s + Cat02 + ARM2 + Cat03 + Cont05_s +
+                      Cat07,
+                    data = red_dat, n.impute = 1, tlinear = F)
+}
+
+# Create dataset with imputed values
+imp <- as.data.frame(impute.transcan(MI, imputation=1, data=red_dat, list.out=TRUE, pr=FALSE, check=FALSE))
+
+# Add USUBJID and PrimRes_na
+imp_dat <- red_dat
+imp_dat[, names(imp)] <- bind_rows(imp)
+imp_dat <- imp_dat[, c(cont_bm, cat_bm, trt, "Outcome")]
+
+# Redundancy Analysis
+red <- redun(formula = ~ Cont09_s + Cat08  + Cont04_s + Cat04 + Cont10_s + Cont02_s + Cat05 + Cat06 +
+               Cont03_s + Cat01 + Cont06_s + Cont08_s + Cont07_s + Cont01_s + Cat02 + ARM2 + Cat03 + Cont05_s +
+               Cat07,
+             r2 = 0.6, type = "adjusted", data = imp_dat)
+
+print(red)
+
+```
+
+## Indicator Functions for Cont09
+Now that we have a complete dataset (no more missing), we must make several transformations
+to run the most appropriate model.
+
+While in general when modeling continuous variables we recommend keeping them in
+continuous form instead of dichotomizing them to avoid throwing away information,
+for Cont09 specifically, experience tells
+us that that there appears to be a point of discontinuity at 0. Therefore we recommend
+best practice to create an indicator variable for when Cont09 = 0 and model all values
+greater than 0 as continuous.
+
+Note that this recommendation is independent of the complications of penalized regression
+and cubic splines we are applying in this analysis.
+
+```{r Indicator, echo = T}
+
+# All biomarkers with Indicator functions
+Ind_bm <- c("Cont09_s")
+
+# Create Indicator functions for Cont09
+imp_dat <- mutate(imp_dat, Ind_Cont09_s_Ind = ifelse(Cont09_s == min(Cont09_s), 1, 0))
+
+# All continuous BM excluding those with Indicator functions
+cont_bm <- cont_bm[!(cont_bm %in% Ind_bm)]
+
+```
+
+
+## Basis Functions for Cubic Splines
+In order to perform penalized regression with splines, we must transform the continuous
+variables into basis functions. Here, we chose to apply splines with 3 knots, thus
+each continuous variable will be transformed to 2 columns of data each representing
+a different basis function for the spline.
+
+In order to aid in the interpretability of the results, we will group the basis
+functions together so that they will undergo the same amount of shrinkage, thus we
+do not have to worry about one basis function for a given variable being removed
+from the model while the other basis function remains. We will implement this via
+the group lasso penalty.
+
+NOTE: If you plan on performing External Validation on a different cohort, it is
+imperative to use the same knot locations to make up the basis functions in the new
+data as was used in the training data. Thus, we demonstrate in this example by saving
+our data object after creating the basis functions.
+
+``` {r Basis_Functions, echo = T}
+# Create dataframe of basis functions for splines of continuous variables
+cont_dat <- list()
+for(i in seq_len(length(cont_bm))){
+  cont_dat[[paste0("mod_", cont_bm[i], "1")]] <- rcs(imp_dat[[cont_bm[[i]]]], 3)[,1]
+  cont_dat[[paste0("mod_", cont_bm[i], "2")]] <- rcs(imp_dat[[cont_bm[[i]]]], 3)[,2]
+}
+
+for(i in seq_len(length(Ind_bm))){
+  cont_dat[[paste0("Ind_", Ind_bm[i], "1")]] <- rcs(imp_dat[[Ind_bm[[i]]]], 3)[,1]
+  cont_dat[[paste0("Ind_", Ind_bm[i], "2")]] <- rcs(imp_dat[[Ind_bm[[i]]]], 3)[,2]
+}
+
+cont_dat <- as.data.frame(cont_dat)
+
+# Save knot locations for External Validation
+if(!file.exists("/stash/results/dev/apfela/P02809_Melanoma_CompositeBM_Meta-analysis/NoY_NoPriorI_NoSimoncont_dat.rds")) {
+saveRDS(cont_dat, file.path(results, paste0(lab_yimp, lab_priorI, lab_simon, "cont_dat.rds")))
+}
+
+```
+
+## Reparameterizing Treatment
+Because the goal of this analysis is to identify biomarkers which we think are likely
+to have a different association with Primary Resistance depending on treatment, it is sometimes
+beneficial to parametrize the treatment variable as +1/-1 instead of the standard dummy coding.
+See [@tian2014simple]. In this particular analysis we tried both parameterizations and present
+the model with standard dummy coding. See the corresponding vignette with Survival outcomes for an example
+with the +1/-1 coding.
+
+``` {r Treatment, echo = T}
+
+# Reparameterize treatment to +1/-1 to apply Tibshirani/Simon method
+if (simon == "Yes") {
+imp_dat$TRT2 <- with(imp_dat, ifelse(ARM2 == "TREATMENT", 1,
+                                     ifelse(ARM2 == "PLACEBO", -1, NA)))
+} else if (simon == "No"){
+  imp_dat$TRT2 <- with(imp_dat, ifelse(ARM2 == "TREATMENT", 1,
+                                       ifelse(ARM2 == "PLACEBO", 0, NA)))
+}
+```
+
+
+## Transforming categorical variables
+The software for Group Lasso (from the `grpreg` package) requires you to provide
+all predictors in matrix form with all categorical variables to be coded as 0/1.
+Thus we make the necessary transformations below.
+
+Note that for categorical variables with >2 levels (as is the case for Cat04 and Cat05),
+we must create 2 distinct dummy variables and then we will group them together as
+we do with the basis functions for continuous variables and the indicator variables
+for Cont09.
+
+``` {r Categorical, echo = T}
+
+# Set up clinical covariates for model
+imp_dat <- mutate(imp_dat, cat_Cat01 = as.numeric(as.factor(Cat01)) - 1)
+imp_dat <- mutate(imp_dat, cat_Cat03 = as.numeric(as.factor(Cat03)) - 1)
+imp_dat <- mutate(imp_dat, Cat04_TypeB = ifelse(Cat04 == "TypeB", 1, 0))
+imp_dat <- mutate(imp_dat, Cat04_TypeC = ifelse(Cat04 == "TypeC", 1, 0))
+imp_dat <- mutate(imp_dat, Cat04_TypeD = ifelse(Cat04 == "TypeD", 1, 0))
+imp_dat <- mutate(imp_dat, Cat05_TypeB = ifelse(Cat05 == "TypeB", 1, 0))
+imp_dat <- mutate(imp_dat, Cat05_TypeC = ifelse(Cat05 == "TypeC", 1, 0))
+imp_dat <- mutate(imp_dat, cat_Cat08 = as.numeric(as.factor(Cat08)) - 1)
+imp_dat <- mutate(imp_dat, cat_Cat07 = Cat07)
+imp_dat <- mutate(imp_dat, cat_Cat06 = Cat06)
+imp_dat <- mutate(imp_dat, cat_Cat02 = Cat02)
+
+mod_Cat04 <- c("Cat04_TypeB", "Cat04_TypeC", "Cat04_TypeD")
+mod_Cat05 <- c("Cat05_TypeB", "Cat05_TypeC")
+mod_clin <- c("cat_Cat01", "cat_Cat03", "cat_Cat08", "cat_Cat07", "cat_Cat06", "cat_Cat02")
+mod_trt <- "TRT2"
+
+# Dataframe to be used for model: Keep only model-ready variables
+mod_dat <- dplyr::select(imp_dat, mod_clin, mod_Cat04, mod_Cat05,
+                         mod_trt, "Outcome", "Ind_Cont09_s_Ind")
+mod_dat <- cbind(mod_dat, cont_dat)
+
+
+# Remove extra levels from factors in dataset
+mod_dat <- droplevels(mod_dat)
+
+```
+
+
+## Interactions
+Next we have to manually create the interactions between each of our predictors and
+treatment. Note that all predictors with the exception of 2-level categorical predictors
+have multiple columns associated with them. We need to multiply every column by the
+treatment variable to make the interaction. We will later group these interaction terms
+which each respective predictor for the group lasso penalty.
+
+
+``` {r Interactions, echo = T}
+
+# Set up data to apply Noah Simon's group lasso method: Manually make interactions
+
+# Continuous variables
+bm <- str_subset(colnames(mod_dat), "mod_")
+mod_dat <- mutate_at(mod_dat, bm, list(modINT = ~. * TRT2))
+INT_bm <- str_subset(colnames(mod_dat), "_modINT")
+
+# MultiLevel categorical variables
+Cat04 <- str_subset(colnames(mod_dat), "Cat04_")
+mod_dat <- mutate_at(mod_dat, Cat04, list(Cat04INT = ~. * TRT2))
+INT_Cat04 <- str_subset(colnames(mod_dat), "_Cat04INT")
+
+Cat05 <- str_subset(colnames(mod_dat), "Cat05_")
+mod_dat <- mutate_at(mod_dat, Cat05, list(Cat05INT = ~. * TRT2))
+INT_Cat05 <- str_subset(colnames(mod_dat), "_Cat05INT")
+
+# Binary Categorical variables
+clin <- str_subset(colnames(mod_dat), "cat_")
+mod_dat <- mutate_at(mod_dat, clin, list(catINT = ~. * TRT2))
+INT_cat <- str_subset(colnames(mod_dat), "_catINT")
+
+# Indicator function variables
+Ind <-  c("Ind_Cont09_s_Ind", "Ind_Cont09_s1", "Ind_Cont09_s2")
+mod_dat <- mutate_at(mod_dat, Ind, list(IndINT = ~. * TRT2))
+INT_Ind <- c("Ind_Cont09_s_Ind_IndINT", "Ind_Cont09_s1_IndINT", "Ind_Cont09_s2_IndINT")
+
+# List of all variables to be included in model
+mod_var <- c(mod_trt, clin, "Cat04", "Cat05", cont_bm, Ind_bm)
+
+```
+
+# Group Lasso Modeling
+
+## Repeated Group Lasso
+Now that the data is finally in shape, we are almost ready to run our model. When
+working with penalized regression, which typically requires some kind of tuning parameter
+selection via Cross-Validation (CV), we recommend running the CV numerous times
+in order to not have to rely on one arbitrary split of the data. Thus we will select the
+tuning parameter which has the minimum median error across the numerous runs.
+
+To implement this recommendation, we make use of a wrapper function, `rep_grpreg`,
+which can be found at
+https://github.com/apfela2/Utility_Functions/blob/main/code/R/grpLasso/rep_grpreg.R
+
+The `rep_grpreg` function contains the following arguments:
+
+
+Parameter        | Details
+-----------------| -----------------------------------------------------------
+data             | dataframe
+x                | Vector of predictor names to be placed in the model - IMPORTANT!!! Pay attention to order of predictors so that groups are assigned correctly
+y                | Name of outcome variable
+group            | Vector of group number assigned to each predictor
+family           | Distribution of outcome. Currently only set up for "binomial"
+penalty          | See grpreg documentation
+lambda_seq       |  Vector of proposed lambda values, recommend to keep NULL
+nfold            |  Number of folds used in inner loop of CV used for tuning parameter selection
+nreps            |  Number of times to repeat the CV procedure
+alpha            | Tuning parameter for elastic net type penalty (how much weight to put on L1 as opposed to L2)
+ncores_rep       |  Number of cores to use if parallelizing
+
+``` {r rep_grpreg, echo = F}
+
+# Run repeated group lasso
+
+# Function for repeated group lasso
+source("https://raw.githubusercontent.com/apfela2/Utility_Functions/main/code/R/grpLasso/rep_grpreg.R")
+
+```
+
+
+``` {r Model, echo = T}
+
+# Sanity check to make sure groups are properly assigned
+tmp <- dplyr::select(mod_dat, c("TRT2", clin, INT_cat, Cat04, INT_Cat04, Cat05, INT_Cat05, bm, INT_bm, Ind, INT_Ind))
+grp <- c(0, rep(1:length(clin), times = 2), rep(length(clin) + 1, times = length(Cat04)*2),
+         rep(length(clin) + 2, times = length(Cat05)*2),
+         rep(seq(length(clin) + 3, length(clin) + 2 + length(cont_bm)), each = 2, times = 2),
+         rep(length(clin) + 2 + length(cont_bm) + 1, each = 3, times = 2))
+cbind(colnames(tmp), grp)
+
+PARAMS <- list(dat = mod_dat,
+               x = colnames(tmp),
+               y = "Outcome",
+               group = grp,
+               penalty = "grLasso",
+               lambda_seq = NULL,
+               nreps    = 50, #inner loop of cv to fit lambda
+               nfold         = 5,  #inner loop of cv to fit lambda
+               # nlambda        = 100, #number of lambdas to evaluate
+               # lambda.type    = "min", #which lambda to select from based on inner loop cv to apply to full model within each outer loop (not full-full model if there's outer loop present)
+               # num_outer_rep  = 100, #number of repeats for outer loop for performance estimation
+               # outer_cv_nfolds = 5,  #number of folds for outer loop of cross-validation
+               font_size   = 18,
+               # run.parallel    = T,
+               ncores_rep = max(1, (detectCores() - 1)),
+               # response = surv.resp,
+               # cont_X = str_subset(colnames(dat), "_Q"),
+               alpha = 0.95,
+               verbose = T)
+
+
+
+set.seed(46363)
+if(!file.exists(file.path("/stash/results/dev/apfela/P02809_Melanoma_CompositeBM_Meta-analysis",
+                          paste0(lab_yimp, lab_priorI, lab_simon, "full_grpreg_anonymized.rds")))) {
+  
+  full_grpreg <- rep_grpreg(data = mod_dat, x = PARAMS$x, y = PARAMS$y, group = PARAMS$group,
+                              penalty = PARAMS$penalty, lambda_seq = PARAMS$lambda_seq,
+                              nreps = PARAMS$nreps, nfold = PARAMS$nfold, alpha = PARAMS$alpha,
+                              ncores_rep = PARAMS$ncores_rep, family = "binomial")
+  
+  saveRDS(full_grpreg, file = file.path(results, paste0(lab_yimp, lab_priorI, lab_simon, "full_grpreg_anonymized.rds")))
+} else {
+  full_grpreg <- readRDS(file = file.path("/stash/results/dev/apfela/P02809_Melanoma_CompositeBM_Meta-analysis",
+                                          paste0(lab_yimp, lab_priorI, lab_simon, "full_grpreg_anonymized.rds")))
+}
+
+```
+
+# Visualizing the Results
+
+## CV Error by Lambda
+The first useful visualization is to look at the distribution of CV Error across
+the range of lambda values. 
+
+You would like to see a figure which shows a decrease in error as lambda increases
+and at a certain influx point see the error increase as lambda increases. This point of
+influx would be the "best lambda".
+
+What you do NOT want to see is the CV Error curve plateau as lambda increases.
+This would tell us that the model with the highest value of lambda (i.e. the Null
+Model) is the best performing model. This implies the chosen model does not provide
+any meaningful information.
+
+
+``` {r CV_Error, echo = T}
+
+# Summarize results from full grpreg model
+
+full_PR <- full_grpreg$full_model
+
+# Set up data for CV Error vs lambda plot
+err_PR <- as.data.frame(full_grpreg$cv_errors)
+sum_err <- data.frame(err.median = apply(err_PR, 2, median), err.sd = apply(err_PR, 2, sd))
+
+sum_err$index <- seq_len(nrow(sum_err))
+sum_err$lambda <- full_grpreg$lambda_seq
+sum_err$log_lambda <- log(full_grpreg$lambda_seq)
+
+
+# Calculate number of groups with non-zero coefficients for each lambda
+X  <-  PARAMS$dat[, PARAMS$x]
+
+ngroups <- predict(full_PR, X = X, type = "ngroups")
+
+# Prepare for plot
+numcoef <- NULL
+for(s in 1:ncol(full_PR$beta)) {
+  numcoef[s] <- ngroups[s]
+}
+
+sum_err <- cbind(sum_err, numcoef)
+min_log_lambda <- log(full_grpreg$best_lambda)
+min_lambda <- full_grpreg$best_lambda
+index <- which.min(sum_err$err.median)
+
+plot.title <- paste0("CV Curve for Median Errors Across ", PARAMS$nreps," Repeats \n grpreg model")
+
+
+ggplot(sum_err, aes(x = log_lambda, y = err.median)) + geom_point() +
+  geom_errorbar(aes(ymin = err.median - err.sd, ymax = err.median + err.sd)) +
+  geom_text(mapping = aes(x = log_lambda, y = max(err.median + err.sd + ((max(err.median) - min(err.median)) / 10)), label = numcoef)) +
+  geom_vline(aes(xintercept = min_log_lambda), linetype = "dashed") +
+  labs(title = plot.title) +
+  theme_bw(PARAMS$font_size) +
+  ylab("Deviance") +
+  xlab("log(Lambda)") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+
+```
+
+In our example we see a nice dip followed by a steep rise in CV Error, a sign that
+there is helpful information provided by our model.
+
+## Lambda Trajectory Plots
+
+Lambda Trajectory plots help give an overview of the strength of the association
+between each of the variables in the model with the outcome and how that association
+changes across the range of lambda. In this application, we are interested in
+the overall association between each variable with outcome as well as the strength
+of the interaction between each variable and treatment with the outcome. Therefore
+we make 2 types of Lambda Trajectory plots. This is also useful forgetting a sense
+of how important each variable is relative to the others.
+
+1. Overall Effect - We take the Group Norm (sqrt of the sum of the squares)
+of the coefficient from all terms in each "group" divided by the sqrt of the number
+of terms in that group.
+
+2. Interaction Terms - We take the Group Norm of only the interaction terms from
+each group divided by the sqrt of the number of terms in that group.
+
+We demonstrate 2 options to visualize these plots: the standard trajectory plot
+and a faceted version. The faceted version may be particularly useful when there
+is strong overlap in the trajectories of many variables.
+
+At times it might be useful to zoom in in the event one variable distorts the scale
+of the y-axis. We illustrate this here as well.
+to be useful.
+
+### Overall Effect
+
+``` {r Trajectory_Overall, echo = T}
+
+# Make manual lambda trajectory plot in order to customize
+
+# Create dataframe of lambda and group norms
+lambda_group <- predict(full_PR, X = X, type = "norm")
+lambda_group <- as.data.frame(lambda_group)
+
+# Fix column names so that lambda values aren't in scientific notation
+colnames(lambda_group) <- round(full_PR$lambda, 7)
+
+
+
+# Set up data for plotting
+
+# Create dataframe mapping coefficients for variables to different lambda values 
+lambda_group <- rownames_to_column(lambda_group, var = "Group")
+lambda_group <- mutate(lambda_group, Biomarker = mod_var)
+lambda_group <- filter(lambda_group, Group != 0)
+
+# Calculate number of terms in each group to appropriately calculate Scaled Norms
+main_rank <- data.frame(Biomarker = lambda_group$Biomarker,
+                        k = c(rep(2, length(clin)),
+                              length(Cat04)*2, length(Cat05)*2,
+                              rep(4, length(cont_bm)), rep(6, length(Ind_bm))))
+
+# Rank biomarkers by Scaled Norm at selected lambda
+main_rank <- mutate(main_rank,
+                    Selected_Norm = lambda_group[,as.character(round(min_lambda, 7))])
+main_rank <- mutate(main_rank,
+                    Selected_Norm_s = Selected_Norm/sqrt(k))
+
+# Reversing order of rank so that largest is first
+main_rank <- mutate(main_rank,
+                    Rank = nrow(main_rank) - rank(Selected_Norm_s,
+                                                  ties.method = "random"))
+
+main_rank <- dplyr::select(main_rank, Biomarker, Rank, Selected_Norm_s)
+
+# Transpose such that each row has coefficient for different variable/lambda combination
+lambda_group_l <- pivot_longer(lambda_group, -c(Group, Biomarker),
+                               names_to = "Lambda", values_to = "Norm")
+lambda_group_l$Lambda <- as.numeric(lambda_group_l$Lambda)
+lambda_group_l <- mutate(lambda_group_l, log_lambda = log(Lambda))
+
+# Calculate number of terms in each group to appropriately calculate Scaled Norms
+tmp <- data.frame(Biomarker = lambda_group$Biomarker,
+                  k = c(rep(2, length(clin)),
+                        length(Cat04)*2, length(Cat05)*2,
+                        rep(4, length(cont_bm)), rep(6, length(Ind_bm))))
+lambda_group_l <- inner_join(lambda_group_l, tmp)
+lambda_group_l <- mutate(lambda_group_l, Scaled_Norm = Norm/sqrt(k))
+lambda_group_l <- inner_join(lambda_group_l, main_rank)
+
+# Make plot with Lambda on x-axis
+ggplot(lambda_group_l, aes(x = Lambda, y = Scaled_Norm, color = Biomarker)) +
+  scale_shape_manual(values = seq(65, length.out = (length(unique(lambda_group_l$Biomarker))))) +
+  # guides(shape = F) +
+  # scale_x_reverse() +
+  geom_vline(xintercept = min_lambda, linetype = "dashed") +
+  geom_point(aes(shape = Biomarker), size = 3) +
+  ggtitle("Scaled Variables by 2*Standard Deviation",
+          subtitle = paste0("Selected Lambda = ", round(min_lambda, 4))) +
+  theme_bw(18)
+
+
+# Zoomed In
+ggplot(lambda_group_l, aes(x = Lambda, y = Scaled_Norm, color = Biomarker)) +
+  scale_shape_manual(values = seq(65, length.out = (length(unique(lambda_group_l$Biomarker))))) +
+  # guides(shape = F) +
+  # scale_x_reverse() +
+  geom_vline(xintercept = min_lambda, linetype = "dashed") +
+  geom_point(aes(shape = Biomarker), size = 3) +
+  coord_cartesian(ylim = c(0, 2.5)) +
+  ggtitle("Scaled Variables by 2*Standard Deviation: Zoomed",
+          subtitle = paste0("Selected Lambda = ", round(min_lambda, 4))) +
+  theme_bw(18)
+
+
+# Faceted version
+ggplot(lambda_group_l, aes(x = Lambda, y = Scaled_Norm)) +
+  scale_shape_manual(values = seq(65, length.out = length(unique(lambda_group_l$Biomarker)))) +
+  geom_point(data = lambda_group_l %>%
+               dplyr::select(-Biomarker), colour = "grey", alpha = 0.7) +
+  geom_point(aes(color = Biomarker), color = "black") +
+  facet_wrap(reorder(Biomarker, Rank) ~ ., nrow = 4, ncol = 5) +
+  geom_text(aes(x = Inf, y = Inf, label = paste0("Selected Norm = ",
+                                                 round(Selected_Norm_s, 2)),
+                size = 2, hjust = 1, vjust = 1)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  ggtitle("Scaled Variables by 2*Standard Deviation", subtitle = paste0("Selected Lambda = ", round(min_lambda, 4))) +
+  geom_vline(xintercept = min_lambda, linetype = "dashed")
+
+
+# Faceted version Zoomed In
+ggplot(lambda_group_l, aes(x = Lambda, y = Scaled_Norm)) +
+  scale_shape_manual(values = seq(65, length.out = length(unique(lambda_group_l$Biomarker)))) +
+  geom_point(data = lambda_group_l %>%
+               dplyr::select(-Biomarker), colour = "grey", alpha = 0.7) +
+  geom_point(aes(color = Biomarker), color = "black") +
+  facet_wrap(reorder(Biomarker, Rank) ~ ., nrow = 4, ncol = 5) +
+  geom_text(aes(x = Inf, y = Inf, label = paste0("Selected Norm = ", round(Selected_Norm_s, 2)),
+                size = 2, hjust = 1, vjust = 2)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  ggtitle("Scaled Variables by 2*Standard Deviation: Zoomed", subtitle = paste0("Selected Lambda = ", round(min_lambda, 4))) +
+  geom_vline(xintercept = min_lambda, linetype = "dashed") +
+  coord_cartesian(ylim = c(0, 2.5))
+
+
+```
+
+### Interaction
+
+``` {r Trajectory_Interaction, echo = T}
+
+# Set up data to make lambda trajectory plot for only Interaction coefficients
+
+mult_cat <- c("Cat04", "Cat05")
+cat_var <- c("cat", mult_cat)
+
+# Create vector of all categorical variable names used in model (to be used later when making PE plots)
+cat_mod <- c(clin, Cat04, Cat05)
+
+# Get coefficients across all lambdas
+coef_lambda <- predict(full_PR, X = X, type = "coefficients")
+coef_lambda <- as.data.frame(coef_lambda)
+
+# Fix column names so that lambda values aren't in scientific notation
+colnames(coef_lambda) <- round(full_PR$lambda, 7)
+
+coef_lambda <- rownames_to_column(coef_lambda, var = "Var")
+
+coef_lambda <- mutate(coef_lambda, Type = ifelse(str_detect(Var, pattern = "INT"),
+                                                 "Interaction", "Main_Effect"))
+
+coef_lambda <- filter(coef_lambda, Var != "TRT2")
+coef_lambda <- filter(coef_lambda, Var != "(Intercept)")
+coef_lambda <- mutate(coef_lambda,
+                      CAT = ifelse(str_detect(Var, pattern = paste(cat_var, collapse = "|")), 1, 0 ))
+
+# Simplify Variable Names such that single name covers all columns for givevn variable
+coef_lambda <- mutate(coef_lambda,
+                      BM = ifelse(CAT == 0 & Type == "Main_Effect" & !str_detect(Var, pattern = "_Ind"),
+                                  str_sub(Var, 1, -2),
+                                 ifelse(CAT == 0 & Type == "Main_Effect" & str_detect(Var, pattern = "_Ind"),
+                                        str_sub(Var, 1, -5),
+                                        ifelse(CAT == 0 & Type == "Interaction" & !str_detect(Var, pattern = "_Ind_"),
+                                               str_sub(Var, 1, -9),
+                                               ifelse(CAT == 0 & Type == "Interaction" & str_detect(Var, pattern = "_Ind_"),
+                                                      str_sub(Var, 1, -12),
+                                                      ifelse(CAT == 1 & Type == "Interaction" & !str_detect(Var, pattern = paste(mult_cat, collapse = "|")),
+                                                             str_sub(Var, 1, -8),
+                                                             ifelse(CAT == 1 & Type == "Interaction" & str_detect(Var, pattern = paste(mult_cat, collapse = "|")),
+                                                                    str_sub(Var, 1, -10), Var)))))))
+
+# Remove prefixes of continuous variables
+coef_lambda <- mutate(coef_lambda, BM2 = ifelse(CAT == 0, str_sub(BM, 5), BM))
+
+
+# Only keep interaction coefficients
+coef_Int <- filter(coef_lambda, Type == "Interaction")
+
+# Remove unnecessary columns
+coef_Int <- dplyr::select(coef_Int, -CAT)
+
+# Collapse Multilevel categorical variables into one name
+coef_Int <- mutate(coef_Int, group = ifelse(str_detect(Var, pattern = "Cat04"), "Cat04",
+                                            ifelse(str_detect(Var, pattern = "Cat05"), "Cat05", BM2)))
+
+# Calculate number of terms in each group for scaling purposes
+coef_Int <- coef_Int %>% group_by(group) %>%
+  mutate(k = length(BM)) %>%
+  ungroup()
+
+# Remove unnecessary columns
+coef_Int <- dplyr::select(coef_Int, -BM, -BM2, -Type)
+
+
+# Transpose data to have column for lambda
+coef_Int_l <- pivot_longer(coef_Int, -c(Var, group, k), names_to = "Lambda", values_to = "coef")
+coef_Int_l$Lambda <- as.numeric(coef_Int_l$Lambda)
+coef_Int_l <- mutate(coef_Int_l, log_lambda = log(Lambda))
+
+# Calculate scaled norms
+coef_Int_l <- coef_Int_l %>%
+  group_by(Lambda, group) %>%
+  mutate(Scaled_Norm = sqrt(sum(coef^2)/k)) %>%
+  distinct(group, .keep_all = T) %>% # Remove duplicate rows of variable within a group
+  arrange(Lambda, group, Var) %>%
+  ungroup()
+
+# Rename group to more intuitive name
+coef_Int_l <- rename(coef_Int_l, Biomarker = group)
+
+# Rank biomarkers by Scaled Norm at selected lambda
+Int_rank <- filter(coef_Int_l, Lambda == round(min_lambda, 7))
+
+# Reversing order of rank so that largest is first
+Int_rank <- mutate(Int_rank,
+                   Rank = nrow(Int_rank) - rank(Scaled_Norm, ties.method = "random"))
+Int_rank <- mutate(Int_rank, Selected_Norm = Scaled_Norm)
+Int_rank <- dplyr::select(Int_rank, Biomarker, Rank, Selected_Norm)
+coef_Int_l <- inner_join(coef_Int_l, Int_rank)
+
+# Make plot with Lambda on x-axis
+ggplot(coef_Int_l, aes(x = Lambda, y = Scaled_Norm, color = Biomarker)) +
+  scale_shape_manual(values = seq(65, length.out = (length(unique(coef_Int_l$Biomarker))))) +
+  # guides(shape = F) +
+  # scale_x_reverse() +
+  geom_vline(xintercept = min_lambda, linetype = "dashed") +
+  geom_point(aes(shape = Biomarker), size = 3) +
+  ggtitle("Interaction Coefficients", subtitle = paste0("Selected Lambda = ", round(min_lambda, 4))) +
+  theme_bw(18)
+
+
+# Zoomed In
+ggplot(coef_Int_l, aes(x = Lambda, y = Scaled_Norm, color = Biomarker)) +
+  scale_shape_manual(values = seq(65, length.out = (length(unique(coef_Int_l$Biomarker))))) +
+  # guides(shape = F) +
+  # scale_x_reverse() +
+  geom_vline(xintercept = min_lambda, linetype = "dashed") +
+  geom_point(aes(shape = Biomarker), size = 3) +
+  coord_cartesian(ylim = c(0, 1.5)) +
+  ggtitle("Interaction Coefficients: Zoomed", subtitle = paste0("Selected Lambda = ", round(min_lambda, 4))) +
+  theme_bw(18)
+
+
+# Faceted version
+ggplot(coef_Int_l, aes(x = Lambda, y = Scaled_Norm)) +
+  scale_shape_manual(values = seq(65, length.out = length(unique(coef_Int_l$Biomarker)))) +
+  geom_point(data = coef_Int_l %>%
+               dplyr::select(-Biomarker), colour = "grey", alpha = 0.7) +
+  geom_point(aes(color = Biomarker), color = "black") +
+  facet_wrap(reorder(Biomarker, Rank) ~ ., nrow = 4, ncol = 5) +
+  geom_text(aes(x = Inf, y = Inf, label = paste0("Selected Norm = ", round(Selected_Norm, 2)),
+                size = 2, hjust = 1, vjust = 1)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  ggtitle("Interaction Coefficients", subtitle = paste0("Selected Lambda = ", round(min_lambda, 4))) +
+  geom_vline(xintercept = min_lambda, linetype = "dashed")
+
+
+# Faceted version Zoomed
+ggplot(coef_Int_l, aes(x = Lambda, y = Scaled_Norm)) +
+  scale_shape_manual(values = seq(65, length.out = length(unique(coef_Int_l$Biomarker)))) +
+  geom_point(data = coef_Int_l %>%
+               dplyr::select(-Biomarker), colour = "grey", alpha = 0.7) +
+  geom_point(aes(color = Biomarker), color = "black") +
+  facet_wrap(reorder(Biomarker, Rank) ~ ., nrow = 4, ncol = 5) +
+  geom_text(aes(x = Inf, y = Inf, label = paste0("Selected Norm = ", round(Selected_Norm, 2)),
+                size = 2, hjust = 1, vjust = 2)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  ggtitle("Interaction Coefficients: Zoomed",
+          subtitle = paste0("Selected Lambda = ", round(min_lambda, 4))) +
+  geom_vline(xintercept = min_lambda, linetype = "dashed") +
+  coord_cartesian(ylim = c(0, 1.5))
+
+
+```
+
+## Partial Effects Plots
+
+In conjunction to seeing the strength of association between each variable and outcome,
+it is useful to see what is the shape of the association. Due to the implementation
+of splines we cannot rely on conventional forest plots for continuous variables
+as they assume a consistent effect across all values of the variable of interest.
+
+### Categorical Variables
+The associations for Categorical variables on the other hand can be summarized by
+the more familiar forest plots. We also demonstrate a scatter plot which provides
+similar information.
+
+
+``` {r PE_Cat, echo = T}
+
+# Partial Effects Plots
+
+
+# Get prediction matrix for selected lambda to use in PE plots
+coef <- predict(full_PR, X = X, type = "coefficients", which = index)
+coef <- rownames_to_column(as.data.frame(coef), var = "Var")
+coef <- rename(coef, coef = as.character(round(full_grpreg$best_lambda, 4))) # The selected lambda
+coef <- mutate(coef, Type = ifelse(str_detect(Var, pattern = "INT"), "Interaction", "Main_Effect"))
+coef <- filter(coef, Var != "TRT2")
+coef <- filter(coef, Var != "(Intercept)")
+coef <- mutate(coef, CAT = ifelse(str_detect(Var, pattern = paste(cat_var, collapse = "|")), 1, 0 ))
+
+# Simplify Variable Names such that single name covers all columns for givevn variable
+coef <- mutate(coef, BM = ifelse(CAT == 0 & Type == "Main_Effect" &
+                                   !str_detect(Var, pattern = "_Ind"), str_sub(Var, 1, -2),
+                                 ifelse(CAT == 0 & Type == "Main_Effect" &
+                                          str_detect(Var, pattern = "_Ind"), str_sub(Var, 1, -5),
+                                        ifelse(CAT == 0 & Type == "Interaction" &
+                                                 !str_detect(Var, pattern = "_Ind_"),
+                                               str_sub(Var, 1, -9),
+                                               ifelse(CAT == 0 & Type == "Interaction" &
+                                                        str_detect(Var, pattern = "_Ind_"),
+                                                      str_sub(Var, 1, -12),
+                                                      ifelse(CAT == 1 & Type == "Interaction" &
+                                                               !str_detect(Var, pattern = paste(mult_cat, collapse = "|")),
+                                                             str_sub(Var, 1, -8),
+                                                             ifelse(CAT == 1 & Type == "Interaction" &
+                                                                      str_detect(Var, pattern = paste(mult_cat, collapse = "|")),
+                                                                    str_sub(Var, 1, -10), Var)))))))
+
+# Remove variables which were filtered out
+coef <- filter(coef, coef != 0)
+
+
+###########################
+# Categorical
+
+
+# Set up data for scatter plot of categorical coefficients
+coef_CAT <- filter(coef, CAT == 1) %>% dplyr::select(-CAT)
+coef_CAT <- mutate(coef_CAT, group = ifelse(str_detect(Var, pattern = "Cat04"), "Cat04",
+                                            ifelse(str_detect(Var, pattern = "Cat05"), "Cat05", BM)))
+
+# Calculate scaled norms
+coef_CAT <- coef_CAT %>% group_by(group, Type) %>%
+  mutate(k = length(coef)) %>%
+  mutate(Norm = sqrt(sum(coef^2)/k)) %>% 
+  ungroup()
+
+# Transpose to calculate contrasts
+coef_cat_w <- pivot_wider(coef_CAT, id_cols = c(BM, group), names_from = Type, values_from = coef)
+
+# Calculate contrasts
+
+if(simon == "Yes"){
+  coef_cat_w <- mutate(coef_cat_w, Placebo = Main_Effect - Interaction)
+  coef_cat_w <- mutate(coef_cat_w, Treatment = Main_Effect + Interaction)
+  coef_cat_w <- mutate(coef_cat_w, Placebo_HR = exp(Placebo))
+  coef_cat_w <- mutate(coef_cat_w, Treatment_HR = exp(Treatment))
+  
+} else if(simon == "No") {
+  
+  coef_cat_w <- mutate(coef_cat_w, Placebo = Main_Effect)
+  coef_cat_w <- mutate(coef_cat_w, Treatment = Main_Effect + Interaction)
+  coef_cat_w <- mutate(coef_cat_w, Placebo_HR = exp(Placebo))
+  coef_cat_w <- mutate(coef_cat_w, Treatment_HR = exp(Treatment))
+}
+
+ggplot(coef_cat_w, aes(x = Placebo, y = Treatment, shape = BM, thick = 5)) +
+  # facet_grid(Model ~ Test) +
+  # geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey") +
+  # annotate("text", x = -0.5, y = -log10(0.05) + 0.2, label = "p = 0.05", color = "grey") +
+  # annotate("text", angle = 270, x = -log10(0.05) + 0.2, y = 3.5, label = "p = 0.05", color = "grey") +
+  # geom_vline(xintercept = -log10(0.05), linetype = "dashed", color = "grey") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey") +
+  geom_point(size = 3, stroke = 2) +
+  scale_shape_manual(values=c(65:(64+length(unique(coef_cat_w$BM))))) +
+  ggtitle("Predicted log(Odds Ratio) for Being Primary Resistant") +
+  ylim(-0.4, 0.8) +
+  xlim(-0.4, 0.8) +
+  coord_fixed() +
+  geom_abline(color = "grey") +
+  theme_bw(18)
+
+
+coef_groups <- predict(full_PR, X = X, type = "norm", which = index)
+names(coef_groups) <- mod_var
+coef_groups <- rownames_to_column(as.data.frame(coef_groups), var = "Var")
+
+# Set up data for Table
+coef_cat_table <- dplyr::select(coef_CAT, group, Type, k, Norm)
+coef_cat_table <- unique(coef_cat_table)
+coef_cat_table <- pivot_wider(coef_cat_table, id_cols = c(group, k), names_from = Type, values_from = Norm)
+coef_cat_table <- inner_join(coef_cat_table, coef_groups, by = c("group" = "Var"))
+coef_cat_table <- rename(coef_cat_table, Group = coef_groups)
+coef_cat_table <- mutate(coef_cat_table, Group = Group/sqrt(k))
+
+
+# Make dot plot of OR for categorical variables
+coef_cat_w <- pivot_longer(coef_cat_w, c(Placebo, Treatment), names_to = "Treatment",
+                           values_to = "log_OR")
+coef_cat_w <- mutate(coef_cat_w, log2_OR = log_OR*log2(exp(1)))
+
+
+ggplot(coef_cat_w, aes(y = BM, x = log2_OR, color = Treatment, shape = Treatment)) +
+  geom_point(size = 5) +
+  scale_shape_discrete(labels=c("Treatment", "Placebo")) +
+  scale_linetype_discrete(labels=c("Treatment", "Placebo")) +
+  scale_color_manual(values = c("red", "blue"), labels = c("Treatment", "Placebo")) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  
+  ylab("Biomarker") +
+  xlab("Log2 OR") +
+  theme_bw(18) +
+  ggtitle("Log2 OR for Having Outcome")
+
+```
+
+### Continuous Variables
+Partial Effects (PE) plots are particularly important when using splines in the model
+for continuous variables since the relationship can no longer be summarized simply
+by the sign of the coefficient and its slope. Rather, since there is no linearity
+assumption we must visualize the whole relationship through Partial Effects plots.
+
+In order to make PE plots, we have to make predictions across a range of values for
+each biomarker for each treatment while keeping everything else constant. In general
+we do not recommend predicting the entire range of observed values because outliers
+will distort the x-axis.In this case study we make predictions for the middle 90%
+of the observed data.
+
+When working with splines, it is important to apply the knots at the same locations
+as they were in the training model.
+
+In the plot below we combine both continuous and categorical variables onto a single
+plot. We found that it can be confusing for some audiences to visualize the categorical
+and continuous variables on different figures and therefore this was a way to avoid
+that confusion. See the grpLasso Vignette with Survival Outcome
+(https://github.com/apfela2/Vignettes/Vignette_grpLasso_Survival) for an example
+of a PE plot with only continuous variables.
+
+NOTE: One very important bug to be wary of when making predictions from grpreg
+models is that it assumes the variables in the newdata are in the same order as
+they were in the training data. If the order changes you will get wrong predictions
+WITHOUT WARNING!
+
+
+``` {r PE_Cont, echo = T}
+
+# Continuous
+
+# Set up data for scatterplot of continuous coefficients
+coef_cont <- filter(coef, CAT == 0) %>% dplyr::select(-CAT)
+coef_cont <- mutate(coef_cont, BM = str_sub(BM, 5, -1))
+
+# Calculate Scaled Norms
+coef_cont <- coef_cont %>% group_by(BM, Type) %>%
+  mutate(k = length(coef)) %>%
+  mutate(Norm = sqrt(sum(coef^2)/k)) %>% 
+  ungroup()
+
+# Create Table
+cont_coef_table <- coef_cont
+cont_coef_table <- dplyr::select(cont_coef_table, Var, BM, coef, Type)
+cont_coef_table <- pivot_wider(cont_coef_table, id_cols = c(Var, BM),
+                               names_from = Type, values_from = coef)
+cont_coef_table <- mutate(cont_coef_table, Main_Effect = round(Main_Effect, 3))
+cont_coef_table <- mutate(cont_coef_table, Interaction = round(Interaction, 3))
+
+# tmp <- dplyr::select(cont_coef_table, Interaction)
+
+coef_cont <- dplyr::select(coef_cont, BM, Type, Norm, k)
+coef_cont <- unique(coef_cont)
+
+# Set up for PE plot
+coef_cont_w <- pivot_wider(coef_cont, id_cols = c(BM, k), names_from = Type, values_from = Norm)
+coef_cont_w <- inner_join(coef_cont_w, coef_groups, by = c("BM" = "Var"))
+coef_cont_w <- rename(coef_cont_w, Group = coef_groups)
+coef_cont_w <- mutate(coef_cont_w, Group = Group/sqrt(k))
+
+
+
+##########################################
+# Set up data for partial effects plots
+##########################################
+
+# Identify knot locations for each continuous covariate
+# cont_dat_s1 <- select(cont_dat, str_subset(colnames(cont_dat), "s1"))
+
+# Sanity checks
+attributes(cont_dat$mod_Cont01_s1)$parms
+attributes(cont_dat$Ind_Cont09_s1)$parms
+
+
+
+# Interpolate, and apply model knot locations to create splines
+cont_raw <- dplyr::select(imp_dat, cont_bm, Ind_bm)
+meds <- sapply(cont_raw, median)
+
+nintp <- 200
+pred_dat <- list()
+pred_dat_names <- list()
+
+
+# Make same names as in model data
+for(i in seq_len(length(cont_bm))){
+  pred_dat_names[[i]] <-  c(paste0("mod_", cont_bm[i], "1"), paste0("mod_", cont_bm[i], "2"))
+}
+
+
+# Start with only cont versions of Cont09 and we'll add Ind versions later
+for(i in seq_len(length(Ind_bm))){
+  pred_dat_names[[i + length(cont_bm)]] <-  c(paste0("Ind_", Ind_bm[i], "1"),
+                                              paste0("Ind_", Ind_bm[i], "2"))
+}
+
+pred_dat_names <- unlist(pred_dat_names)
+
+# Create vector of ALL cont bm
+all_bm <- c(cont_bm, Ind_bm)
+
+# For 1st BM we create 2 (one for each ARM) sequences from 10% to 90% followed by median for remaining BM
+# For 2nd BM and on we start with median for preceding BM followed by sequence
+for(i in seq_len(length(cont_bm))){
+  if(i == 1) {
+    pred_dat[[cont_bm[i]]] <- c(rep(seq(quantile(imp_dat[[cont_bm[i]]], 0.05),
+                                        quantile(imp_dat[[cont_bm[i]]], 0.95),
+                                        length.out = nintp), 2),
+                                rep(meds[i], (length(all_bm)-i)*nintp*2)) 
+  } else {
+    pred_dat[[cont_bm[i]]] <- c(rep(meds[i], (i-1)*nintp*2),
+                                rep(seq(quantile(imp_dat[[cont_bm[i]]], 0.05),
+                                        quantile(imp_dat[[cont_bm[i]]], 0.95),
+                                        length.out = nintp), 2), rep(meds[i],
+                                                                     (length(all_bm)-i)*nintp*2))     
+  }
+  
+  # Create 2 basis functions from interpolated data using same knots as in model
+  # NOTE: This code assumes there were only 3 knots in model for all continuous variables
+  pred_dat[[paste0("mod_", cont_bm[i], "1")]] <- rcs(pred_dat[[cont_bm[[i]]]],
+                                                     attributes(cont_dat[[paste0("mod_", cont_bm[i], "1")]])$parms,
+                                                     name = pred_dat_names[(2*i) - 1])[,1]
+  attr(pred_dat[[paste0("mod_", cont_bm[i], "1")]], "dimnames") <- NULL
+  pred_dat[[paste0("mod_", cont_bm[i], "2")]] <- rcs(pred_dat[[cont_bm[[i]]]],
+                                                     attributes(cont_dat[[paste0("mod_", cont_bm[i], "2")]])$parms,
+                                                     name = pred_dat_names[2*i])[,2]
+  attr(pred_dat[[paste0("mod_", cont_bm[i], "2")]], "dimnames") <- NULL
+}
+
+# For Cont09 treat as 2nd BM or later from previous chunk
+for(i in seq_len(length(Ind_bm))){
+  j <- length(cont_bm) + i # Convenience to recalibrate Ind_bm to cont_bm
+  pred_dat[[Ind_bm[i]]] <- c(rep(meds[j], (j - 1)*nintp*2),
+                             rep(seq(quantile(imp_dat[[Ind_bm[i]]], 0.05),
+                                     quantile(imp_dat[[Ind_bm[i]]], 0.95),
+                                     length.out = nintp), 2),
+                             rep(meds[j], (length(all_bm)-j)*nintp*2))     
+  
+  pred_dat[[paste0("Ind_", Ind_bm[i], "1")]] <- rcs(pred_dat[[Ind_bm[[i]]]],
+                                                    attributes(cont_dat[[paste0("Ind_", Ind_bm[i], "1")]])$parms,
+                                                    name = pred_dat_names[(2*j) - 1])[,1]
+  attr(pred_dat[[paste0("Ind_", Ind_bm[i], "1")]], "dimnames") <- NULL
+  pred_dat[[paste0("Ind_", Ind_bm[i], "2")]] <- rcs(pred_dat[[Ind_bm[[i]]]],
+                                                    attributes(cont_dat[[paste0("Ind_", Ind_bm[i], "2")]])$parms,
+                                                    name = pred_dat_names[2*j])[,2]
+  attr(pred_dat[[paste0("Ind_", Ind_bm[i], "2")]], "dimnames") <- NULL
+}
+
+
+pred_dat <- as.data.frame(pred_dat)
+
+# Create Indicator functions for Cont09
+pred_dat <- mutate(pred_dat, Ind_Cont09_s_Ind = ifelse(Cont09_s == min(imp_dat$Cont09_s), 1, 0))
+
+
+# Keep only terms used in model
+pred_dat <- dplyr::select(pred_dat, str_subset(colnames(pred_dat), "mod"),
+                          str_subset(colnames(pred_dat), "Ind"))
+
+# Create TRT2
+if(simon == "Yes") {
+pred_dat$TRT2 <- rep(c(1, -1), each = nintp, times = length(all_bm))
+} else if(simon == "No"){
+  pred_dat$TRT2 <- rep(c(1, 0), each = nintp, times = length(all_bm))
+}
+
+
+# Create categorical variables set to reference levels
+for(var in cat_mod){
+  pred_dat[[var]] <- 0
+}
+
+# Create interactions for all variables
+pred_dat <- mutate_at(pred_dat, bm, list(modINT = ~. * TRT2))
+pred_dat <- mutate_at(pred_dat, Cat04, list(Cat04INT = ~. * TRT2))
+pred_dat <- mutate_at(pred_dat, Cat05, list(Cat05INT = ~. * TRT2))
+pred_dat <- mutate_at(pred_dat, clin, list(catINT = ~. * TRT2))
+pred_dat <- mutate_at(pred_dat, Ind, list(IndINT = ~. * TRT2))
+
+
+#################################
+# Get predictions
+###################################
+
+# !!!! BUG IN predict.grpsurv !!!!
+# Must have prediction matrix IN SAME ORDER as training data! If not, results will be INCORRECT WITH NO WARNING!!!
+
+# Ensure prediction matrix is same order as training data
+pred_dat <- dplyr::select(pred_dat, PARAMS$x)
+pred_mat <- as.matrix(pred_dat)
+
+# Get Predictions
+pred_dat$preds <- predict(full_PR, X = pred_mat, type = "link", which = index)
+
+# Identify which BM is getting predicted
+pred_dat$BM <- rep(all_bm, each = 2*nintp)
+
+#################################
+# Make partial effects plots
+##################################
+
+raw_bm <- sub("_s$", "", all_bm)
+plot_dat <- list()
+
+# Create dataframe of variables on original scale, but mapping predictions
+for(i in seq_len(length(raw_bm))) {
+  plot_dat[[raw_bm[i]]] <- rep(seq(quantile(red_dat[[raw_bm[i]]], 0.05, na.rm = T),
+                                   quantile(red_dat[[raw_bm[i]]], 0.95, na.rm = T),
+                                   length.out = nintp), 2) 
+}
+
+
+plot_dat <- as.data.frame(plot_dat)
+
+plot_dat$TRT <-  rep(c("Treatment", "Placebo"), each = nintp)
+
+plot_dat <- pivot_longer(plot_dat, -TRT, names_to = "Biomarker", values_to = "Value")
+
+# Rearrange in order to match up order with pred_dat
+plot_dat <- arrange(plot_dat, match(Biomarker, raw_bm), TRT, Value)
+
+# Since everything matches, we transfer preds
+plot_dat$preds <- pred_dat$preds
+
+plot_dat <- mutate(plot_dat, log2_preds = preds*log2(exp(1)))
+
+# Identify filtered BM
+filtered <- mod_var[!(mod_var %in% mod_var[predict(full_PR, X = X, type = "groups", which = index)])]
+filtered <- sub("_s$", "", filtered)
+
+# Filter out biomarkers removed
+plot_dat_filtered <- filter(plot_dat, !(Biomarker %in% filtered))
+
+
+
+
+# Separate out point of discontinuity for better visualization
+nuggets <- filter(plot_dat_filtered, Biomarker == "Cont09" & Value == min(red_dat$Cont09, na.rm = T))
+nuggets <- mutate(nuggets, Value2 = Value - 1)
+
+
+no_nugget <- filter(plot_dat_filtered, (Biomarker == "Cont09" &
+                                          Value != min(red_dat$Cont09, na.rm = T)) | Biomarker != "Cont09")
+
+
+# Create dataframe for categorical variables with corresponding columns
+coef_cat_w <- mutate(coef_cat_w,
+                     BM2 = ifelse(str_detect(BM, pattern = "cat|TypeB|TypeB"), 1,
+                                  ifelse(str_detect(BM, pattern = "TypeC|TypeC"), 2, 3)))
+                                              
+cat_plot_dat <- data.frame(TRT = coef_cat_w$Treatment, Biomarker = coef_cat_w$group,
+                           Value = coef_cat_w$BM2, preds = coef_cat_w$log_OR,
+                           log2_preds = coef_cat_w$log2_OR)
+
+
+# Combine with no_nuggets dataframe
+combined_plot_dat <- rbind(no_nugget, cat_plot_dat)
+
+# Set up ranking to combine
+Int_rank2 <- Int_rank
+Int_rank2 <- mutate(Int_rank2, Biomarker = gsub("_s", "", Biomarker))
+combined_plot_dat <- inner_join(combined_plot_dat, Int_rank2)
+combined_plot_dat$Biomarker <- reorder(combined_plot_dat$Biomarker, combined_plot_dat$Rank)
+nuggets <- inner_join(nuggets, Int_rank2)
+nuggets$Biomarker <- reorder(nuggets$Biomarker, nuggets$Rank)
+cat_plot_dat <- inner_join(cat_plot_dat, Int_rank2)
+cat_plot_dat$Biomarker <- reorder(cat_plot_dat$Biomarker, cat_plot_dat$Rank)
+
+all_bm2 <- gsub("_s", "", all_bm)
+
+
+tmp <- ggplot(combined_plot_dat, aes(x = Value, y = log2_preds, color = TRT, linetype = TRT)) +
+  geom_line(data = subset(combined_plot_dat, Biomarker == all_bm2)) +
+  geom_line(data = subset(combined_plot_dat, Biomarker == "Cont09")) + # To get around bug where some of Cont09 is not plotted
+  facet_wrap(~Biomarker, scales = "free_x") +
+  ylab("Log2 Relative Odds") +
+  xlab("Normalized Predictor Value") +
+  scale_shape_discrete(labels=c("Treatment", "Placebo")) +
+  scale_linetype_discrete(labels=c("Treatment", "Placebo")) +
+  scale_color_manual(values = c("red", "blue"), labels = c("Treatment", "Placebo")) +
+  theme_bw()
+
+tmp +
+geom_point(data=nuggets,
+                 aes(x=Value2,y=log2_preds, color = TRT, shape = TRT), size = 3) +
+geom_point(data = cat_plot_dat,
+           aes(x = Value, y = log2_preds, color = TRT), inherit.aes = F) +
+  geom_hline(yintercept = 0, linetype = "dashed")
+  # scale_x_discrete()
+
+
+
+```
+# References
+
+<!-- From https://stackoverflow.com/questions/41532707/include-rmd-appendix-after-references
+ div tells Pandoc to include the refs here, rather than at the end of the document. -->
+ 
+<div id="refs"></div>
+
+# System Information
+
+***Time required to process this report:*** *`r format(Sys.time() - startTime)`*
+
+***R session information:***
+
+```{r, echo_session_info}
+sessionInfo()
+```
+
+```{r, domino, results="asis"}
+if (Sys.getenv("DOMINO_WORKING_DIR") != "") {
+  cat(paste("\n\n## Domino environment details",
+            paste("**Domino User:**", Sys.getenv("DOMINO_PROJECT_OWNER")),
+            paste("**Domino Project:**", Sys.getenv("DOMINO_PROJECT_NAME")),
+            paste("**Domino Run ID:**", Sys.getenv("DOMINO_RUN_ID")),
+            paste("**Domino Run #:**", Sys.getenv("DOMINO_RUN_NUMBER")),
+            sep="\n\n"))
+}
+```
+
+
+
+
